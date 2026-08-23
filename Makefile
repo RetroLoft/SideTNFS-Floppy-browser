@@ -12,13 +12,20 @@ LDFLAGS    = -s -lgem
 
 TARGET      = FLOPPY.PRG
 SRCS        = src/main.c src/profile.c src/floppy_probe.c src/dialog.c
+INSTALLDIR  = /mnt/retroloft/retro/Atari.ST/CONFIG
 
-all: $(TARGET)
+# 'all' always installs too, same convention SideTNFS-Config's own
+# Makefile uses: every successful build is copied straight to the CONFIG
+# share, no separate 'make install' step needed.
+all: $(TARGET) install
 
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS) $(LDFLAGS)
 
+install: $(TARGET)
+	cp -v $(TARGET) $(INSTALLDIR)/
+
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all clean
+.PHONY: all install clean
