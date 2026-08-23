@@ -1,0 +1,20 @@
+# Build products
+FLOPPY.PRG
+*.PRG
+*.o
+*.map
+*.lst
+build/
+dist/
+
+# Local runtime and Atari desktop configuration
+EMUDESK.INF
+NEWDESK.INF
+
+# Local editor and assistant state
+.vscode/
+.claude/
+
+# Temporary files
+*.bak
+*~
