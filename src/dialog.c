@@ -247,6 +247,8 @@ static const char *floppy_status_text(unsigned long status)
     case FLOPPY_STATUS_FLASH_WRITE_FAILED:    return "Flash write failed.";
     case FLOPPY_STATUS_CRC_MISMATCH:          return "Flash CRC mismatch.";
     case FLOPPY_STATUS_UNSUPPORTED_VERSION:   return "Unsupported protocol version.";
+    case FLOPPY_STATUS_INVALID_BACKEND:       return "Invalid backend (not TNFS or SD).";
+    case FLOPPY_STATUS_INVALID_SD_PATH:       return "SD path is empty.";
     default:                                  return "Unknown status.";
     }
 }
@@ -272,15 +274,24 @@ static void wire_to_ui_profile(const FloppyProfileInfo *w, Profile *p)
     if (p->state == PROFILE_SLOT_EMPTY)
         return; /* every other field stays zeroed -- meaningless when EMPTY */
 
+    /* An unrecognized wire backend value defaults to TNFS -- matches the
+     * firmware's own SET_PROFILE unpacking default (gemdrvemul.c) and can
+     * only happen against a corrupted/mismatched-protocol firmware, since
+     * sidetnfs_floppy_config_set_profile() itself never stores a value
+     * outside TNFS/SD. */
+    p->backend = (w->backend == FLOPPY_BACKEND_SD) ? PROFILE_BACKEND_SD : PROFILE_BACKEND_TNFS;
+
     p->port = (int)w->port;
     strncpy(p->nickname, w->nickname, PROFILE_NICK_LEN - 1);
     p->nickname[PROFILE_NICK_LEN - 1] = '\0';
+    strncpy(p->last_directory, w->last_directory, PROFILE_LASTDIR_LEN - 1);
+    p->last_directory[PROFILE_LASTDIR_LEN - 1] = '\0';
     strncpy(p->host, w->host, PROFILE_HOST_LEN - 1);
     p->host[PROFILE_HOST_LEN - 1] = '\0';
     strncpy(p->mount_path, w->mount_path, PROFILE_MOUNT_LEN - 1);
     p->mount_path[PROFILE_MOUNT_LEN - 1] = '\0';
-    strncpy(p->last_directory, w->last_directory, PROFILE_LASTDIR_LEN - 1);
-    p->last_directory[PROFILE_LASTDIR_LEN - 1] = '\0';
+    strncpy(p->sd_path, w->sd_path, PROFILE_SDPATH_LEN - 1);
+    p->sd_path[PROFILE_SDPATH_LEN - 1] = '\0';
 }
 
 static void ui_to_wire_profile(const Profile *p, FloppyProfileInfo *w)
@@ -296,13 +307,18 @@ static void ui_to_wire_profile(const Profile *p, FloppyProfileInfo *w)
     if (p->state == PROFILE_SLOT_EMPTY)
         return; /* every other field stays zeroed (memset above) */
 
+    w->backend = (p->backend == PROFILE_BACKEND_SD) ? FLOPPY_BACKEND_SD : FLOPPY_BACKEND_TNFS;
     w->port = (unsigned long)p->port;
     strncpy(w->nickname, p->nickname, FLOPPY_NICKNAME_LEN - 1);
+    strncpy(w->last_directory, p->last_directory, FLOPPY_LASTDIR_LEN - 1);
     strncpy(w->host, p->host, FLOPPY_HOST_LEN - 1);
     strncpy(w->mount_path, p->mount_path, FLOPPY_MOUNTPATH_LEN - 1);
-    strncpy(w->last_directory, p->last_directory, FLOPPY_LASTDIR_LEN - 1);
+    strncpy(w->sd_path, p->sd_path, FLOPPY_SDPATH_LEN - 1);
     /* NUL-termination of every field is already guaranteed by the
-     * memset(w,0,...) above, same reasoning ui_to_wire_drive() gives. */
+     * memset(w,0,...) above, same reasoning ui_to_wire_drive() gives.
+     * Sending both TNFS and SD fields regardless of `backend` is
+     * harmless -- the firmware only ever validates/stores whichever one
+     * `backend` actually selects (see sidetnfs_floppy_config.c). */
 }
 
 /* ================================================================== */
@@ -315,13 +331,20 @@ static int validate_profile(const Profile *p, char *msg)
         sprintf(msg, "[3][Validation error|Nickname is empty.][OK]");
         return 0;
     }
-    if (!buf_nonempty(p->host)) {
-        sprintf(msg, "[3][Validation error|Host is empty.][OK]");
-        return 0;
-    }
-    if (p->port < 1 || p->port > 65535) {
-        sprintf(msg, "[3][Validation error|Port must be 1-65535.][OK]");
-        return 0;
+    if (p->backend == PROFILE_BACKEND_SD) {
+        if (!buf_nonempty(p->sd_path)) {
+            sprintf(msg, "[3][Validation error|SD path is empty.][OK]");
+            return 0;
+        }
+    } else {
+        if (!buf_nonempty(p->host)) {
+            sprintf(msg, "[3][Validation error|Host is empty.][OK]");
+            return 0;
+        }
+        if (p->port < 1 || p->port > 65535) {
+            sprintf(msg, "[3][Validation error|Port must be 1-65535.][OK]");
+            return 0;
+        }
     }
     return 1;
 }
@@ -437,15 +460,26 @@ static int perform_save(ProfileConfig *cfg, char *msg)
 /* TCP is not offered here either (same "UDP only, this phase" limit the */
 /* reused firmware convention already applies). last_directory is        */
 /* application state, not shown here (see profile.h's own comment).      */
+/*                                                                        */
+/* Unlike any editor in SIDETNFS-Config (which picks TNFS-vs-SD once, at  */
+/* creation time, via add_disk_type_run(), by opening one of two          */
+/* permanently-different dialogs), this editor is ONE dialog with a live  */
+/* Source: TNFS/SD toggle -- the TNFS fields (Host/Port/Mount dir) and    */
+/* the SD field (SD path) occupy the SAME reserved vertical span and are  */
+/* shown/hidden via the OBJECT HIDETREE flag as the toggle is clicked, so */
+/* the dialog's own size never changes. This is new UI plumbing this      */
+/* project needed that the reused source material doesn't demonstrate.   */
 /* ================================================================== */
 enum {
     FP_ROOT = 0,
     FP_TITLE,
     FP_DIV1,
     FP_LBL_NICK,  FP_NICK_EDIT,
-    FP_LBL_HOST,  FP_HOST_EDIT,
-    FP_LBL_PORT,  FP_PORT_EDIT,
-    FP_LBL_MOUNT, FP_MOUNT_EDIT, FP_MOUNT_HINT,
+    FP_LBL_SOURCE, FP_SOURCE_BTN,
+    FP_LBL_HOST,  FP_HOST_EDIT,       /* TNFS only */
+    FP_LBL_PORT,  FP_PORT_EDIT,       /* TNFS only */
+    FP_LBL_MOUNT, FP_MOUNT_EDIT, FP_MOUNT_HINT, /* TNFS only */
+    FP_LBL_SDPATH, FP_SDPATH_EDIT,    /* SD only */
     FP_LBL_ACTIVE, FP_ACTIVE_BTN,
     FP_DIV2,
     FP_DELETE, FP_OK, FP_CANCEL,
@@ -453,22 +487,31 @@ enum {
 };
 static OBJECT fp_dlg[FP_NOBJS];
 
-#define FP_BUF_NICK  PROFILE_NICK_LEN  /* 24 */
-#define FP_BUF_HOST  PROFILE_HOST_LEN  /* 64 */
-#define FP_BUF_PORT  7
-#define FP_BUF_MOUNT PROFILE_MOUNT_LEN /* 32 */
+/* Every TNFS-only vs SD-only object id, for the HIDETREE toggle below. */
+static const int fp_tnfs_objs[] = { FP_LBL_HOST, FP_HOST_EDIT, FP_LBL_PORT, FP_PORT_EDIT, FP_LBL_MOUNT, FP_MOUNT_EDIT, FP_MOUNT_HINT };
+static const int fp_sd_objs[]   = { FP_LBL_SDPATH, FP_SDPATH_EDIT };
+#define FP_TNFS_OBJS_COUNT ((int)(sizeof(fp_tnfs_objs) / sizeof(fp_tnfs_objs[0])))
+#define FP_SD_OBJS_COUNT   ((int)(sizeof(fp_sd_objs) / sizeof(fp_sd_objs[0])))
 
-static char buf_fp_nick [FP_BUF_NICK];
-static char buf_fp_host [FP_BUF_HOST];
-static char buf_fp_port [FP_BUF_PORT];
-static char buf_fp_mount[FP_BUF_MOUNT];
+#define FP_BUF_NICK   PROFILE_NICK_LEN   /* 24 */
+#define FP_BUF_HOST   PROFILE_HOST_LEN   /* 64 */
+#define FP_BUF_PORT   7
+#define FP_BUF_MOUNT  PROFILE_MOUNT_LEN  /* 32 */
+#define FP_BUF_SDPATH PROFILE_SDPATH_LEN /* 256 */
 
-static char tmpl_fp_nick[FP_BUF_NICK],   vld_fp_nick[FP_BUF_NICK];
-static char tmpl_fp_host[FP_BUF_HOST],   vld_fp_host[FP_BUF_HOST];
-static char tmpl_fp_port[FP_BUF_PORT],   vld_fp_port[FP_BUF_PORT];
-static char tmpl_fp_mount[FP_BUF_MOUNT], vld_fp_mount[FP_BUF_MOUNT];
+static char buf_fp_nick  [FP_BUF_NICK];
+static char buf_fp_host  [FP_BUF_HOST];
+static char buf_fp_port  [FP_BUF_PORT];
+static char buf_fp_mount [FP_BUF_MOUNT];
+static char buf_fp_sdpath[FP_BUF_SDPATH];
 
-static TEDINFO ti_fp_nick, ti_fp_host, ti_fp_port, ti_fp_mount;
+static char tmpl_fp_nick[FP_BUF_NICK],     vld_fp_nick[FP_BUF_NICK];
+static char tmpl_fp_host[FP_BUF_HOST],     vld_fp_host[FP_BUF_HOST];
+static char tmpl_fp_port[FP_BUF_PORT],     vld_fp_port[FP_BUF_PORT];
+static char tmpl_fp_mount[FP_BUF_MOUNT],   vld_fp_mount[FP_BUF_MOUNT];
+static char tmpl_fp_sdpath[FP_BUF_SDPATH], vld_fp_sdpath[FP_BUF_SDPATH];
+
+static TEDINFO ti_fp_nick, ti_fp_host, ti_fp_port, ti_fp_mount, ti_fp_sdpath;
 
 /* Active/Inactive toggle -- single button, own text doubles as the value
  * display, same "button with changing text" idiom SIDETNFS-Config's
@@ -477,6 +520,11 @@ static TEDINFO ti_fp_nick, ti_fp_host, ti_fp_port, ti_fp_mount;
 static char buf_fp_active[FP_ACTIVE_BUF];
 static int fp_editor_enabled; /* 1 = Active/ENABLED, 0 = Inactive/DISABLED -- live edit state */
 
+/* Source: TNFS/SD toggle -- same "button with changing text" idiom. */
+#define FP_SOURCE_BUF 6
+static char buf_fp_source[FP_SOURCE_BUF];
+static ProfileBackend fp_editor_backend; /* live edit state */
+
 static int fields_ready = 0;
 
 static void shared_fields_init(void)
@@ -484,15 +532,17 @@ static void shared_fields_init(void)
     if (fields_ready) return;
     fields_ready = 1;
 
-    fill_n(tmpl_fp_nick,  '_', FP_BUF_NICK  - 1); fill_n(vld_fp_nick,  'X', FP_BUF_NICK  - 1);
-    fill_n(tmpl_fp_host,  '_', FP_BUF_HOST  - 1); fill_n(vld_fp_host,  'X', FP_BUF_HOST  - 1);
-    fill_n(tmpl_fp_port,  '_', FP_BUF_PORT  - 1); fill_n(vld_fp_port,  '9', FP_BUF_PORT  - 1);
-    fill_n(tmpl_fp_mount, '_', FP_BUF_MOUNT - 1); fill_n(vld_fp_mount, 'X', FP_BUF_MOUNT - 1);
+    fill_n(tmpl_fp_nick,   '_', FP_BUF_NICK   - 1); fill_n(vld_fp_nick,   'X', FP_BUF_NICK   - 1);
+    fill_n(tmpl_fp_host,   '_', FP_BUF_HOST   - 1); fill_n(vld_fp_host,   'X', FP_BUF_HOST   - 1);
+    fill_n(tmpl_fp_port,   '_', FP_BUF_PORT   - 1); fill_n(vld_fp_port,   '9', FP_BUF_PORT   - 1);
+    fill_n(tmpl_fp_mount,  '_', FP_BUF_MOUNT  - 1); fill_n(vld_fp_mount,  'X', FP_BUF_MOUNT  - 1);
+    fill_n(tmpl_fp_sdpath, '_', FP_BUF_SDPATH - 1); fill_n(vld_fp_sdpath, 'X', FP_BUF_SDPATH - 1);
 
-    init_ti(&ti_fp_nick,  buf_fp_nick,  tmpl_fp_nick,  vld_fp_nick,  FP_BUF_NICK);
-    init_ti(&ti_fp_host,  buf_fp_host,  tmpl_fp_host,  vld_fp_host,  FP_BUF_HOST);
-    init_ti(&ti_fp_port,  buf_fp_port,  tmpl_fp_port,  vld_fp_port,  FP_BUF_PORT);
-    init_ti(&ti_fp_mount, buf_fp_mount, tmpl_fp_mount, vld_fp_mount, FP_BUF_MOUNT);
+    init_ti(&ti_fp_nick,   buf_fp_nick,   tmpl_fp_nick,   vld_fp_nick,   FP_BUF_NICK);
+    init_ti(&ti_fp_host,   buf_fp_host,   tmpl_fp_host,   vld_fp_host,   FP_BUF_HOST);
+    init_ti(&ti_fp_port,   buf_fp_port,   tmpl_fp_port,   vld_fp_port,   FP_BUF_PORT);
+    init_ti(&ti_fp_mount,  buf_fp_mount,  tmpl_fp_mount,  vld_fp_mount,  FP_BUF_MOUNT);
+    init_ti(&ti_fp_sdpath, buf_fp_sdpath, tmpl_fp_sdpath, vld_fp_sdpath, FP_BUF_SDPATH);
 }
 
 static void update_fp_active_button_text(void)
@@ -501,11 +551,40 @@ static void update_fp_active_button_text(void)
     buf_fp_active[FP_ACTIVE_BUF - 1] = '\0';
 }
 
+static void update_fp_source_button_text(void)
+{
+    strncpy(buf_fp_source, (fp_editor_backend == PROFILE_BACKEND_SD) ? " SD  " : "TNFS ", FP_SOURCE_BUF - 1);
+    buf_fp_source[FP_SOURCE_BUF - 1] = '\0';
+}
+
+/* Shows the TNFS fields and hides the SD field, or vice versa, via the
+ * HIDETREE object flag -- both sets occupy the same reserved vertical
+ * span (see fp_dialog_init()), so no resize/redraw of anything but these
+ * objects is needed. Caller redraws FP_ROOT afterward. */
+static void fp_apply_backend_visibility(void)
+{
+    int i;
+    int show_tnfs = (fp_editor_backend != PROFILE_BACKEND_SD);
+
+    for (i = 0; i < FP_TNFS_OBJS_COUNT; i++) {
+        if (show_tnfs)
+            fp_dlg[fp_tnfs_objs[i]].ob_flags &= (unsigned short)(~HIDETREE);
+        else
+            fp_dlg[fp_tnfs_objs[i]].ob_flags |= (unsigned short)HIDETREE;
+    }
+    for (i = 0; i < FP_SD_OBJS_COUNT; i++) {
+        if (show_tnfs)
+            fp_dlg[fp_sd_objs[i]].ob_flags |= (unsigned short)HIDETREE;
+        else
+            fp_dlg[fp_sd_objs[i]].ob_flags &= (unsigned short)(~HIDETREE);
+    }
+}
+
 static void fp_dialog_init(int show_delete)
 {
     LayoutMetrics lm;
     int DW, DH, xl, xf;
-    int yt, ydiv1, ynick, yhost, yport, ymount, ymounthint, yactive, ydiv2, ybtn;
+    int yt, ydiv1, ynick, ysource, yblock0, yhost, yport, ymount, ymounthint, ysdpath, yactive, ydiv2, ybtn;
 
     layout_metrics_get(&lm);
 
@@ -516,11 +595,18 @@ static void fp_dialog_init(int show_delete)
     yt         = lm.tm;
     ydiv1      = yt + lm.rh + 1;
     ynick      = ydiv1 + 5;
-    yhost      = ynick + lm.pitch;
+    ysource    = ynick + lm.pitch;
+    yblock0    = ysource + lm.pitch;
+    /* TNFS block: 4 rows (host/port/mount/hint), reserved regardless of
+     * which source is currently shown, so the dialog's own height never
+     * changes when the user toggles Source. */
+    yhost      = yblock0;
     yport      = yhost + lm.pitch;
     ymount     = yport + lm.pitch;
     ymounthint = ymount + lm.pitch;
-    yactive    = ymounthint + lm.pitch;
+    /* SD block: 1 row, sharing the same starting y as the TNFS block. */
+    ysdpath    = yblock0;
+    yactive    = yblock0 + 4 * lm.pitch;
     ydiv2      = yactive + lm.rh + 2;
     ybtn       = ydiv2 + 7;
     DH         = ybtn + lm.rh + lm.tm + 3;
@@ -529,7 +615,7 @@ static void fp_dialog_init(int show_delete)
     fp_dlg[FP_ROOT].ob_spec.index = 0x00031070L;
 
     set_obj(fp_dlg, FP_TITLE, G_STRING, NONE, NORMAL, 15*lm.cw, yt, 16*lm.cw, lm.rh);
-    fp_dlg[FP_TITLE].ob_spec.free_string = "Floppy Server";
+    fp_dlg[FP_TITLE].ob_spec.free_string = "Floppy Source";
 
     set_obj(fp_dlg, FP_DIV1, G_BOX, NONE, NORMAL, lm.cw, ydiv1, DW - 2*lm.cw, 2);
     fp_dlg[FP_DIV1].ob_spec.index = 0x00001171L;
@@ -538,6 +624,11 @@ static void fp_dialog_init(int show_delete)
     fp_dlg[FP_LBL_NICK].ob_spec.free_string = "Nickname:";
     set_obj(fp_dlg, FP_NICK_EDIT, G_FBOXTEXT, EDITABLE, NORMAL, xf, ynick, 23*lm.cw, lm.rh);
     fp_dlg[FP_NICK_EDIT].ob_spec.tedinfo = &ti_fp_nick;
+
+    set_obj(fp_dlg, FP_LBL_SOURCE, G_STRING, NONE, NORMAL, xl, ysource, 11*lm.cw, lm.rh);
+    fp_dlg[FP_LBL_SOURCE].ob_spec.free_string = "Source:";
+    set_obj(fp_dlg, FP_SOURCE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xf, ysource, 8*lm.cw, lm.rh);
+    fp_dlg[FP_SOURCE_BTN].ob_spec.free_string = buf_fp_source;
 
     set_obj(fp_dlg, FP_LBL_HOST, G_STRING, NONE, NORMAL, xl, yhost, 11*lm.cw, lm.rh);
     fp_dlg[FP_LBL_HOST].ob_spec.free_string = "Host:";
@@ -558,6 +649,14 @@ static void fp_dialog_init(int show_delete)
      * SIDETNFS-Config's TNFS drive editor uses. */
     set_obj(fp_dlg, FP_MOUNT_HINT, G_STRING, NONE, NORMAL, xf, ymounthint, 30*lm.cw, lm.rh);
     fp_dlg[FP_MOUNT_HINT].ob_spec.free_string = "empty = server root";
+
+    set_obj(fp_dlg, FP_LBL_SDPATH, G_STRING, NONE, NORMAL, xl, ysdpath, 11*lm.cw, lm.rh);
+    fp_dlg[FP_LBL_SDPATH].ob_spec.free_string = "SD folder:";
+    /* te_txtlen/te_tmplen (set by init_ti() above) allow the full 255
+     * characters; the on-screen box is narrower and scrolls, standard GEM
+     * text-field behavior when the buffer is longer than the display. */
+    set_obj(fp_dlg, FP_SDPATH_EDIT, G_FBOXTEXT, EDITABLE, NORMAL, xf, ysdpath, 31*lm.cw, lm.rh);
+    fp_dlg[FP_SDPATH_EDIT].ob_spec.tedinfo = &ti_fp_sdpath;
 
     set_obj(fp_dlg, FP_LBL_ACTIVE, G_STRING, NONE, NORMAL, xl, yactive, 11*lm.cw, lm.rh);
     fp_dlg[FP_LBL_ACTIVE].ob_spec.free_string = "Status:";
@@ -584,32 +683,39 @@ static void fp_load_from_profile(const Profile *p, int is_new)
 {
     char port_str[FP_BUF_PORT];
 
-    set_buf(buf_fp_nick,  FP_BUF_NICK, p->nickname);
-    set_buf(buf_fp_host,  FP_BUF_HOST, p->host);
+    set_buf(buf_fp_nick,   FP_BUF_NICK,   p->nickname);
+    set_buf(buf_fp_host,   FP_BUF_HOST,   p->host);
     sprintf(port_str, "%d", p->port);
-    set_buf(buf_fp_port,  FP_BUF_PORT, port_str);
-    set_buf(buf_fp_mount, FP_BUF_MOUNT, p->mount_path);
+    set_buf(buf_fp_port,   FP_BUF_PORT,   port_str);
+    set_buf(buf_fp_mount,  FP_BUF_MOUNT,  p->mount_path);
+    set_buf(buf_fp_sdpath, FP_BUF_SDPATH, p->sd_path);
 
-    /* A new (EMPTY) slot defaults to Active/ENABLED unless the user
-     * explicitly toggles it off before OK -- same convention
-     * SIDETNFS-Config's TNFS drive editor uses. */
+    /* A new (EMPTY) slot defaults to Active/ENABLED and Source: TNFS
+     * unless the user explicitly changes either before OK -- same
+     * "active by default" convention SIDETNFS-Config's TNFS drive editor
+     * uses. */
     fp_editor_enabled = is_new ? 1 : (p->state == PROFILE_SLOT_ENABLED);
+    fp_editor_backend = is_new ? PROFILE_BACKEND_TNFS : p->backend;
     update_fp_active_button_text();
+    update_fp_source_button_text();
+    fp_apply_backend_visibility();
 }
 
 static void fp_save_to_profile(Profile *p)
 {
-    buf_copy(buf_fp_nick,  p->nickname,   PROFILE_NICK_LEN);
-    buf_copy(buf_fp_host,  p->host,       PROFILE_HOST_LEN);
-    buf_copy(buf_fp_mount, p->mount_path, PROFILE_MOUNT_LEN);
+    buf_copy(buf_fp_nick,   p->nickname,   PROFILE_NICK_LEN);
+    buf_copy(buf_fp_host,   p->host,       PROFILE_HOST_LEN);
+    buf_copy(buf_fp_mount,  p->mount_path, PROFILE_MOUNT_LEN);
+    buf_copy(buf_fp_sdpath, p->sd_path,    PROFILE_SDPATH_LEN);
 
     if (p->mount_path[0] == '\0') {
         p->mount_path[0] = '/';
         p->mount_path[1] = '\0';
     }
 
-    p->port  = atoi(buf_fp_port); /* range-checked by validate_profile() */
-    p->state = fp_editor_enabled ? PROFILE_SLOT_ENABLED : PROFILE_SLOT_DISABLED;
+    p->port    = atoi(buf_fp_port); /* range-checked by validate_profile() when backend == TNFS */
+    p->state   = fp_editor_enabled ? PROFILE_SLOT_ENABLED : PROFILE_SLOT_DISABLED;
+    p->backend = fp_editor_backend;
 }
 
 /* Returns 2 if the profile was removed (cleared to EMPTY), 1 if
@@ -626,6 +732,7 @@ static int fp_editor_run(ProfileConfig *cfg, int index)
 
     if (is_new) {
         memset(&working, 0, sizeof(working));
+        working.backend = PROFILE_BACKEND_TNFS;
         working.port = 16384; /* matches the reused firmware's own TNFS default */
         working.mount_path[0] = '/';
         working.mount_path[1] = '\0';
@@ -642,6 +749,13 @@ static int fp_editor_run(ProfileConfig *cfg, int index)
         which = dialog_click(fp_dlg, FP_NICK_EDIT);
 
         switch (which) {
+        case FP_SOURCE_BTN:
+            fp_editor_backend = (fp_editor_backend == PROFILE_BACKEND_SD) ? PROFILE_BACKEND_TNFS : PROFILE_BACKEND_SD;
+            update_fp_source_button_text();
+            fp_apply_backend_visibility();
+            objc_draw(fp_dlg, FP_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            break;
+
         case FP_ACTIVE_BTN:
             fp_editor_enabled = !fp_editor_enabled;
             update_fp_active_button_text();
@@ -650,7 +764,7 @@ static int fp_editor_run(ProfileConfig *cfg, int index)
 
         case FP_DELETE:
             if (!is_new) {
-                if (form_alert(1, "[2][Remove this server profile?][Remove|Cancel]") == 1)
+                if (form_alert(1, "[2][Remove this floppy source?][Remove|Cancel]") == 1)
                     done = 2;
             }
             break;
@@ -718,7 +832,11 @@ static void fe_dialog_init(void)
 
     layout_metrics_get(&lm);
 
-    DW = 46 * lm.cw;
+    /* 50 chars wide -- matches SIDETNFS-Config's own widest dialogs
+     * (RESEARCH-STEP0.md section 3.3), needed here to fit the longer row
+     * text ("1* Active   [TNFS] Nickname...", ~36 chars) added for the SD
+     * backend. */
+    DW = 50 * lm.cw;
     yt    = lm.tm;
     ydiv1 = yt + lm.rh + 1;
     yrow0 = ydiv1 + 5;
@@ -729,8 +847,8 @@ static void fe_dialog_init(void)
     set_obj(fe_dlg, FE_ROOT, G_BOX, NONE, NORMAL, 0, 0, DW, DH);
     fe_dlg[FE_ROOT].ob_spec.index = 0x00031070L;
 
-    set_obj(fe_dlg, FE_TITLE, G_STRING, NONE, NORMAL, 12*lm.cw, yt, 22*lm.cw, lm.rh);
-    fe_dlg[FE_TITLE].ob_spec.free_string = "Edit Floppy Servers";
+    set_obj(fe_dlg, FE_TITLE, G_STRING, NONE, NORMAL, 14*lm.cw, yt, 22*lm.cw, lm.rh);
+    fe_dlg[FE_TITLE].ob_spec.free_string = "Edit Floppy Sources";
 
     set_obj(fe_dlg, FE_DIV1, G_BOX, NONE, NORMAL, lm.cw, ydiv1, DW - 2*lm.cw, 2);
     fe_dlg[FE_DIV1].ob_spec.index = 0x00001171L;
@@ -738,10 +856,10 @@ static void fe_dialog_init(void)
     for (i = 0; i < MAX_PROFILES; i++) {
         int ry = yrow0 + i * lm.pitch;
 
-        set_obj(fe_dlg, FE_ROW_TEXT(i), G_STRING, NONE, NORMAL, lm.cw, ry, 32*lm.cw, lm.rh);
+        set_obj(fe_dlg, FE_ROW_TEXT(i), G_STRING, NONE, NORMAL, lm.cw, ry, 38*lm.cw, lm.rh);
         fe_dlg[FE_ROW_TEXT(i)].ob_spec.free_string = fe_row_text[i];
 
-        set_obj(fe_dlg, FE_ROW_BTN(i), G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 34*lm.cw, ry, 8*lm.cw, lm.rh);
+        set_obj(fe_dlg, FE_ROW_BTN(i), G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 40*lm.cw, ry, 8*lm.cw, lm.rh);
         fe_dlg[FE_ROW_BTN(i)].ob_spec.free_string = "  Add   ";
     }
 
@@ -775,8 +893,9 @@ static void fe_refresh_rows(const ProfileConfig *cfg)
             fe_dlg[FE_ROW_BTN(i)].ob_spec.free_string = "  Add   ";
         } else {
             const char *state_word = profile_slot_is_enabled(p) ? "Active" : "Inactive";
+            const char *backend_word = (p->backend == PROFILE_BACKEND_SD) ? "SD  " : "TNFS";
             const char *active_mark = (i == cfg->active_index) ? "*" : " ";
-            sprintf(fe_row_text[i], "%d%s %-8s %-22.22s", i + 1, active_mark, state_word, p->nickname);
+            sprintf(fe_row_text[i], "%d%s %-8s [%s] %-17.17s", i + 1, active_mark, state_word, backend_word, p->nickname);
             fe_dlg[FE_ROW_BTN(i)].ob_spec.free_string = "  Edit  ";
         }
     }
@@ -878,7 +997,7 @@ static void fs_dialog_init(void)
     fs_dlg[FS_DIV2].ob_spec.index = 0x00001171L;
 
     set_obj(fs_dlg, FS_EDIT, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 2*lm.cw, ybtn, 16*lm.cw, lm.rh);
-    fs_dlg[FS_EDIT].ob_spec.free_string = "Edit servers...";
+    fs_dlg[FS_EDIT].ob_spec.free_string = "Edit sources...";
 
     set_obj(fs_dlg, FS_CANCEL, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 24*lm.cw, ybtn, 8*lm.cw, lm.rh);
     fs_dlg[FS_CANCEL].ob_spec.free_string = " Cancel ";
@@ -894,7 +1013,8 @@ static void fs_refresh_rows(const ProfileConfig *cfg)
         const Profile *p = &cfg->profiles[i];
 
         if (profile_slot_is_configured(p)) {
-            sprintf(fs_row_text[i], "%s%-.20s", (i == cfg->active_index) ? "> " : "  ", p->nickname);
+            const char *tag = (p->backend == PROFILE_BACKEND_SD) ? "[SD]    " : "[Server]";
+            sprintf(fs_row_text[i], "%s%s %-.18s", (i == cfg->active_index) ? "> " : "  ", tag, p->nickname);
             fs_dlg[FS_ROW(i)].ob_state &= (unsigned short)(~DISABLED);
         } else {
             sprintf(fs_row_text[i], "  -- empty --");
