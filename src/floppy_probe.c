@@ -34,7 +34,7 @@
  *     send_sync_write_command_to_sidecart's even-address word-copy loop
  *     does. The firmware's COPY_AND_CHANGE_ENDIANESS_BLOCK16 un-swaps this
  *     back into the original byte order on receipt.
- *   - uint16_t request params (SET_PROFILE's state/port): sent as ONE
+ *   - uint16_t request params (SET_PROFILE's state/backend/port): sent as ONE
  *     address-encoded read of the raw value, matching
  *     GET_PAYLOAD_PARAM16(payload) = payload[0].
  *   - uint32_t request params (index): sent as two address-encoded reads
@@ -68,20 +68,28 @@
 #define RESP_CONFIG_ACTIVE_INDEX_OFFSET 0x45A4UL
 #define RESP_CONFIG_STATUS_OFFSET       0x45A8UL
 
-/* GEMDRVEMUL_FLOPPY_PROFILE = CONFIG_STATUS + 4 = 0x45AC. */
+/* GEMDRVEMUL_FLOPPY_PROFILE = CONFIG_STATUS + 4 = 0x45AC. Field order and
+ * offsets re-walked by hand from gemdrvemul.h (floppyemu branch) after the
+ * SD-backend addition -- state/backend/port are now three separate
+ * uint16_t fields (was state/port only), and last_directory now comes
+ * BEFORE host/mount_path/sd_path (was after) -- see that header's own
+ * GEMDRVEMUL_FLOPPY_PROFILE_* chain, not independently guessed. */
 #define PROFILE_STATUS_OFFSET   0x45ACUL /* uint32_t */
 #define PROFILE_STATE_OFFSET    0x45B0UL /* uint16_t */
-#define PROFILE_PORT_OFFSET     0x45B2UL /* uint16_t */
-#define PROFILE_NICKNAME_OFFSET 0x45B4UL /* char[24] */
-#define PROFILE_HOST_OFFSET     0x45CCUL /* char[64] */
-#define PROFILE_MOUNT_PATH_OFFSET 0x460CUL /* char[32] */
-#define PROFILE_LAST_DIRECTORY_OFFSET 0x462CUL /* char[256], block ends 0x472C */
+#define PROFILE_BACKEND_OFFSET  0x45B2UL /* uint16_t */
+#define PROFILE_PORT_OFFSET     0x45B4UL /* uint16_t */
+#define PROFILE_NICKNAME_OFFSET 0x45B6UL /* char[24] */
+#define PROFILE_LAST_DIRECTORY_OFFSET 0x45CEUL /* char[256] */
+#define PROFILE_HOST_OFFSET     0x46CEUL /* char[64] -- TNFS only */
+#define PROFILE_MOUNT_PATH_OFFSET 0x470EUL /* char[32] -- TNFS only */
+#define PROFILE_SD_PATH_OFFSET  0x472EUL /* char[256] -- SD only, block ends 0x482E */
 
 /* SET_PROFILE request payload size, excluding the 4-byte token:
- * index(4) + state+port(2 each=4) + strings (24+64+32+256=376) = 384 bytes. */
+ * index(4) + state+backend+port(2 each=6) + strings
+ * (24+256+64+32+256=632) = 642 bytes. */
 #define SET_PROFILE_PAYLOAD_BYTES \
-    (4UL + 2UL*2UL + (unsigned long)FLOPPY_NICKNAME_LEN + (unsigned long)FLOPPY_HOST_LEN + \
-     (unsigned long)FLOPPY_MOUNTPATH_LEN + (unsigned long)FLOPPY_LASTDIR_LEN)
+    (4UL + 2UL*3UL + (unsigned long)FLOPPY_NICKNAME_LEN + (unsigned long)FLOPPY_LASTDIR_LEN + \
+     (unsigned long)FLOPPY_HOST_LEN + (unsigned long)FLOPPY_MOUNTPATH_LEN + (unsigned long)FLOPPY_SDPATH_LEN)
 
 #define PROBE_TIMEOUT_SEC       2
 #define SAVE_PROFILES_TIMEOUT_SEC 5 /* SAVE_PROFILES does real flash erase+program */
@@ -204,14 +212,16 @@ int floppy_probe_get_profile(unsigned long index, FloppyProfileInfo *info)
     if (!wait_for_token(seed, PROBE_TIMEOUT_SEC))
         return FLOPPY_PROBE_TIMEOUT;
 
-    info->status = rom3_read_long(PROFILE_STATUS_OFFSET);
-    info->state  = rom3_read_word(PROFILE_STATE_OFFSET);
-    info->port   = rom3_read_word(PROFILE_PORT_OFFSET);
+    info->status  = rom3_read_long(PROFILE_STATUS_OFFSET);
+    info->state   = rom3_read_word(PROFILE_STATE_OFFSET);
+    info->backend = rom3_read_word(PROFILE_BACKEND_OFFSET);
+    info->port    = rom3_read_word(PROFILE_PORT_OFFSET);
 
     read_string_field(PROFILE_NICKNAME_OFFSET,      info->nickname,      FLOPPY_NICKNAME_LEN);
-    read_string_field(PROFILE_HOST_OFFSET,           info->host,          FLOPPY_HOST_LEN);
-    read_string_field(PROFILE_MOUNT_PATH_OFFSET,     info->mount_path,    FLOPPY_MOUNTPATH_LEN);
     read_string_field(PROFILE_LAST_DIRECTORY_OFFSET, info->last_directory, FLOPPY_LASTDIR_LEN);
+    read_string_field(PROFILE_HOST_OFFSET,          info->host,          FLOPPY_HOST_LEN);
+    read_string_field(PROFILE_MOUNT_PATH_OFFSET,    info->mount_path,    FLOPPY_MOUNTPATH_LEN);
+    read_string_field(PROFILE_SD_PATH_OFFSET,       info->sd_path,       FLOPPY_SDPATH_LEN);
     return FLOPPY_PROBE_OK;
 }
 
@@ -221,11 +231,13 @@ int floppy_probe_set_profile(unsigned long index, const FloppyProfileInfo *in, u
 
     send_param32(index);
     send_param16(in->state);
+    send_param16(in->backend);
     send_param16(in->port);
     send_string_field(in->nickname,      FLOPPY_NICKNAME_LEN);
+    send_string_field(in->last_directory, FLOPPY_LASTDIR_LEN);
     send_string_field(in->host,          FLOPPY_HOST_LEN);
     send_string_field(in->mount_path,    FLOPPY_MOUNTPATH_LEN);
-    send_string_field(in->last_directory, FLOPPY_LASTDIR_LEN);
+    send_string_field(in->sd_path,       FLOPPY_SDPATH_LEN);
 
     if (!wait_for_token(seed, PROBE_TIMEOUT_SEC))
         return FLOPPY_PROBE_TIMEOUT;
