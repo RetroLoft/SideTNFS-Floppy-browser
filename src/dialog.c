@@ -474,8 +474,8 @@ enum {
     FP_ROOT = 0,
     FP_TITLE,
     FP_DIV1,
+    FP_LBL_SOURCE, FP_SOURCE_TNFS_BTN, FP_SOURCE_SD_BTN,
     FP_LBL_NICK,  FP_NICK_EDIT,
-    FP_LBL_SOURCE, FP_SOURCE_BTN,
     FP_LBL_HOST,  FP_HOST_EDIT,       /* TNFS only */
     FP_LBL_PORT,  FP_PORT_EDIT,       /* TNFS only */
     FP_LBL_MOUNT, FP_MOUNT_EDIT, FP_MOUNT_HINT, /* TNFS only */
@@ -520,9 +520,11 @@ static TEDINFO ti_fp_nick, ti_fp_host, ti_fp_port, ti_fp_mount, ti_fp_sdpath;
 static char buf_fp_active[FP_ACTIVE_BUF];
 static int fp_editor_enabled; /* 1 = Active/ENABLED, 0 = Inactive/DISABLED -- live edit state */
 
-/* Source: TNFS/SD toggle -- same "button with changing text" idiom. */
-#define FP_SOURCE_BUF 6
-static char buf_fp_source[FP_SOURCE_BUF];
+/* Source: TNFS / SD card -- two side-by-side buttons, exactly one
+ * SELECTED at a time, manually kept mutually exclusive -- same "manual
+ * SELECTED-pair radio idiom" SIDETNFS-Config's NC_DHCP_BTN/NC_STATIC_BTN
+ * use (RESEARCH-STEP0.md section 3.8), not GEM's own RBUTTON grouping
+ * (that codebase never uses RBUTTON either, per that same research). */
 static ProfileBackend fp_editor_backend; /* live edit state */
 
 static int fields_ready = 0;
@@ -551,10 +553,15 @@ static void update_fp_active_button_text(void)
     buf_fp_active[FP_ACTIVE_BUF - 1] = '\0';
 }
 
-static void update_fp_source_button_text(void)
+static void update_fp_source_buttons(void)
 {
-    strncpy(buf_fp_source, (fp_editor_backend == PROFILE_BACKEND_SD) ? " SD  " : "TNFS ", FP_SOURCE_BUF - 1);
-    buf_fp_source[FP_SOURCE_BUF - 1] = '\0';
+    if (fp_editor_backend == PROFILE_BACKEND_SD) {
+        fp_dlg[FP_SOURCE_SD_BTN].ob_state |= (unsigned short)SELECTED;
+        fp_dlg[FP_SOURCE_TNFS_BTN].ob_state &= (unsigned short)(~SELECTED);
+    } else {
+        fp_dlg[FP_SOURCE_TNFS_BTN].ob_state |= (unsigned short)SELECTED;
+        fp_dlg[FP_SOURCE_SD_BTN].ob_state &= (unsigned short)(~SELECTED);
+    }
 }
 
 /* Shows the TNFS fields and hides the SD field, or vice versa, via the
@@ -584,7 +591,7 @@ static void fp_dialog_init(int show_delete)
 {
     LayoutMetrics lm;
     int DW, DH, xl, xf;
-    int yt, ydiv1, ynick, ysource, yblock0, yhost, yport, ymount, ymounthint, ysdpath, yactive, ydiv2, ybtn;
+    int yt, ydiv1, ysource, ynick, yblock0, yhost, yport, ymount, ymounthint, ysdpath, yactive, ydiv2, ybtn;
 
     layout_metrics_get(&lm);
 
@@ -594,9 +601,9 @@ static void fp_dialog_init(int show_delete)
 
     yt         = lm.tm;
     ydiv1      = yt + lm.rh + 1;
-    ynick      = ydiv1 + 5;
-    ysource    = ynick + lm.pitch;
-    yblock0    = ysource + lm.pitch;
+    ysource    = ydiv1 + 5;
+    ynick      = ysource + lm.pitch;
+    yblock0    = ynick + lm.pitch;
     /* TNFS block: 4 rows (host/port/mount/hint), reserved regardless of
      * which source is currently shown, so the dialog's own height never
      * changes when the user toggles Source. */
@@ -620,15 +627,17 @@ static void fp_dialog_init(int show_delete)
     set_obj(fp_dlg, FP_DIV1, G_BOX, NONE, NORMAL, lm.cw, ydiv1, DW - 2*lm.cw, 2);
     fp_dlg[FP_DIV1].ob_spec.index = 0x00001171L;
 
+    set_obj(fp_dlg, FP_LBL_SOURCE, G_STRING, NONE, NORMAL, xl, ysource, 11*lm.cw, lm.rh);
+    fp_dlg[FP_LBL_SOURCE].ob_spec.free_string = "Source:";
+    set_obj(fp_dlg, FP_SOURCE_TNFS_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xf, ysource, 10*lm.cw, lm.rh);
+    fp_dlg[FP_SOURCE_TNFS_BTN].ob_spec.free_string = "  TNFS  ";
+    set_obj(fp_dlg, FP_SOURCE_SD_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xf + 11*lm.cw, ysource, 10*lm.cw, lm.rh);
+    fp_dlg[FP_SOURCE_SD_BTN].ob_spec.free_string = "SD card ";
+
     set_obj(fp_dlg, FP_LBL_NICK, G_STRING, NONE, NORMAL, xl, ynick, 11*lm.cw, lm.rh);
     fp_dlg[FP_LBL_NICK].ob_spec.free_string = "Nickname:";
     set_obj(fp_dlg, FP_NICK_EDIT, G_FBOXTEXT, EDITABLE, NORMAL, xf, ynick, 23*lm.cw, lm.rh);
     fp_dlg[FP_NICK_EDIT].ob_spec.tedinfo = &ti_fp_nick;
-
-    set_obj(fp_dlg, FP_LBL_SOURCE, G_STRING, NONE, NORMAL, xl, ysource, 11*lm.cw, lm.rh);
-    fp_dlg[FP_LBL_SOURCE].ob_spec.free_string = "Source:";
-    set_obj(fp_dlg, FP_SOURCE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xf, ysource, 8*lm.cw, lm.rh);
-    fp_dlg[FP_SOURCE_BTN].ob_spec.free_string = buf_fp_source;
 
     set_obj(fp_dlg, FP_LBL_HOST, G_STRING, NONE, NORMAL, xl, yhost, 11*lm.cw, lm.rh);
     fp_dlg[FP_LBL_HOST].ob_spec.free_string = "Host:";
@@ -697,7 +706,7 @@ static void fp_load_from_profile(const Profile *p, int is_new)
     fp_editor_enabled = is_new ? 1 : (p->state == PROFILE_SLOT_ENABLED);
     fp_editor_backend = is_new ? PROFILE_BACKEND_TNFS : p->backend;
     update_fp_active_button_text();
-    update_fp_source_button_text();
+    update_fp_source_buttons();
     fp_apply_backend_visibility();
 }
 
@@ -749,9 +758,16 @@ static int fp_editor_run(ProfileConfig *cfg, int index)
         which = dialog_click(fp_dlg, FP_NICK_EDIT);
 
         switch (which) {
-        case FP_SOURCE_BTN:
-            fp_editor_backend = (fp_editor_backend == PROFILE_BACKEND_SD) ? PROFILE_BACKEND_TNFS : PROFILE_BACKEND_SD;
-            update_fp_source_button_text();
+        case FP_SOURCE_TNFS_BTN:
+            fp_editor_backend = PROFILE_BACKEND_TNFS;
+            update_fp_source_buttons();
+            fp_apply_backend_visibility();
+            objc_draw(fp_dlg, FP_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            break;
+
+        case FP_SOURCE_SD_BTN:
+            fp_editor_backend = PROFILE_BACKEND_SD;
+            update_fp_source_buttons();
             fp_apply_backend_visibility();
             objc_draw(fp_dlg, FP_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
             break;
@@ -1374,8 +1390,11 @@ static int cd_run(char *current_dir, const char *root_dir)
 /* the already-existing selector/editor dialogs directly; there is no    */
 /* separate chooser dialog of its own anymore.                           */
 /* ================================================================== */
-#define FM_MAX_VISIBLE_FILES 10 /* placeholder count for the mock data above; the real
-                                  * browser (Step 2) pages at 25 entries (RESEARCH-STEP0.md) */
+/* 25 entries per page matches the LFN browser page size RESEARCH-STEP0.md
+ * already settled on -- this mock list happens to only have 6 entries
+ * today, but the row layout itself is sized for the real Step 2 count
+ * from the start, not a smaller placeholder. */
+#define FM_MAX_VISIBLE_FILES 25
 enum {
     FM_ROOT = 0,
     FM_TITLE,
@@ -1395,9 +1414,20 @@ enum {
 #define FM_NOBJS         (FM_AFTER_ROWS + 5)
 static OBJECT fm_dlg[FM_NOBJS];
 
+/* 78 characters wide -- the Atari ST's own medium/high resolution text
+ * width (640px / 8px font = 80 chars), minus a 1-char margin each side --
+ * per the task brief, so filenames can display up to 76 characters
+ * (RESEARCH-STEP0.md's own "~80 chars, truncate cleanly" browser display
+ * decision). This is now clearly the widest dialog in this application,
+ * wider than SIDETNFS-Config's own 50-char widest dialogs. */
+#define FM_DIALOG_CHARS 78
+#define FM_CONTENT_CHARS 76 /* FM_DIALOG_CHARS minus the 1-char margin each side */
+
+#define FM_TITLE_BUF  FM_DIALOG_CHARS
 #define FM_SOURCE_BUF 48 /* "Source: " (8) + nickname (20) + "   Type: " (9) + backend word (up to 4) + NUL = 42 */
-#define FM_DIR_BUF    56
-#define FM_ROW_BUF    40
+#define FM_DIR_BUF    (11 + FM_CONTENT_CHARS + 1) /* "Directory: " + up to FM_CONTENT_CHARS + NUL */
+#define FM_ROW_BUF    (FM_CONTENT_CHARS + 1)      /* up to FM_CONTENT_CHARS of filename + NUL */
+static char fm_title_text[FM_TITLE_BUF]; /* current directory (or a placeholder) -- see fm_refresh() */
 static char fm_source_line[FM_SOURCE_BUF];
 static char fm_dir_line[FM_DIR_BUF];
 static char fm_row_text[FM_MAX_VISIBLE_FILES][FM_ROW_BUF];
@@ -1414,7 +1444,7 @@ static void fm_dialog_init(void)
 
     layout_metrics_get(&lm);
 
-    DW = 50 * lm.cw;
+    DW = FM_DIALOG_CHARS * lm.cw;
     yt      = lm.tm;
     ydiv1   = yt + lm.rh + 1;
     ysource = ydiv1 + 5;
@@ -1428,16 +1458,20 @@ static void fm_dialog_init(void)
     set_obj(fm_dlg, FM_ROOT, G_BOX, NONE, NORMAL, 0, 0, DW, DH);
     fm_dlg[FM_ROOT].ob_spec.index = 0x00031070L;
 
-    set_obj(fm_dlg, FM_TITLE, G_STRING, NONE, NORMAL, 20*lm.cw, yt, 12*lm.cw, lm.rh);
-    fm_dlg[FM_TITLE].ob_spec.free_string = "FLOPPY.PRG";
+    /* The dialog title is the current directory (see fm_refresh()), not a
+     * static "FLOPPY.PRG" -- the desktop's own menu bar already names the
+     * running application across the top of the screen, so repeating it
+     * here was pure duplication. */
+    set_obj(fm_dlg, FM_TITLE, G_STRING, NONE, NORMAL, lm.cw, yt, FM_CONTENT_CHARS*lm.cw, lm.rh);
+    fm_dlg[FM_TITLE].ob_spec.free_string = fm_title_text;
 
     set_obj(fm_dlg, FM_DIV1, G_BOX, NONE, NORMAL, lm.cw, ydiv1, DW - 2*lm.cw, 2);
     fm_dlg[FM_DIV1].ob_spec.index = 0x00001171L;
 
-    set_obj(fm_dlg, FM_SOURCE_LINE, G_STRING, NONE, NORMAL, lm.cw, ysource, 46*lm.cw, lm.rh);
+    set_obj(fm_dlg, FM_SOURCE_LINE, G_STRING, NONE, NORMAL, lm.cw, ysource, FM_CONTENT_CHARS*lm.cw, lm.rh);
     fm_dlg[FM_SOURCE_LINE].ob_spec.free_string = fm_source_line;
 
-    set_obj(fm_dlg, FM_DIR_LINE, G_STRING, NONE, NORMAL, lm.cw, ydir, 46*lm.cw, lm.rh);
+    set_obj(fm_dlg, FM_DIR_LINE, G_STRING, NONE, NORMAL, lm.cw, ydir, FM_CONTENT_CHARS*lm.cw, lm.rh);
     fm_dlg[FM_DIR_LINE].ob_spec.free_string = fm_dir_line;
 
     set_obj(fm_dlg, FM_DIV2, G_BOX, NONE, NORMAL, lm.cw, ydiv2, DW - 2*lm.cw, 2);
@@ -1445,7 +1479,7 @@ static void fm_dialog_init(void)
 
     for (i = 0; i < FM_MAX_VISIBLE_FILES; i++) {
         int ry = yrow0 + i * lm.pitch;
-        set_obj(fm_dlg, FM_ROW(i), G_STRING, SELECTABLE | RBUTTON, NORMAL, lm.cw, ry, 46*lm.cw, lm.rh);
+        set_obj(fm_dlg, FM_ROW(i), G_STRING, SELECTABLE | RBUTTON, NORMAL, lm.cw, ry, FM_CONTENT_CHARS*lm.cw, lm.rh);
         fm_dlg[FM_ROW(i)].ob_spec.free_string = fm_row_text[i];
     }
 
@@ -1467,10 +1501,10 @@ static void fm_dialog_init(void)
     wire_tree(fm_dlg, FM_NOBJS);
 }
 
-/* Repopulates the source/directory lines and the (mock) file list, and
- * always clears any file selection -- called on startup and after every
- * Source/Change Dir action, per the task brief's "wis een eventueel
- * geselecteerd image... maak Start opnieuw inactief" rule. */
+/* Repopulates the title, source/directory lines, and the (mock) file
+ * list, and always clears any file selection -- called on startup and
+ * after every Source/Change Dir action, per the task brief's "wis een
+ * eventueel geselecteerd image... maak Start opnieuw inactief" rule. */
 static void fm_refresh(const ProfileConfig *cfg)
 {
     const Profile *p;
@@ -1481,11 +1515,19 @@ static void fm_refresh(const ProfileConfig *cfg)
 
     if (have_active) {
         p = &cfg->profiles[cfg->active_index];
-        sprintf(fm_source_line, "Source: %-.20s   Type: %s", p->nickname, profile_backend_word(p));
         profile_current_dir(p, dir, sizeof(dir));
-        sprintf(fm_dir_line, "Directory: %-.34s", dir);
+        /* The dialog title IS the current directory -- see fm_dialog_init()'s
+         * own comment on why this replaced a static "FLOPPY.PRG" title. */
+        sprintf(fm_title_text, "%.76s", dir);
+        sprintf(fm_source_line, "Source: %-.20s   Type: %s", p->nickname, profile_backend_word(p));
+        sprintf(fm_dir_line, "Directory: %-.65s", dir);
         sprintf(fm_source_btn_text, "Source: %s", profile_backend_word(p));
     } else {
+        /* No profile configured yet -- "/Floppies" is the placeholder
+         * shown until a real source/directory exists, per the task
+         * brief's own example. */
+        strncpy(fm_title_text, "/Floppies", FM_TITLE_BUF - 1);
+        fm_title_text[FM_TITLE_BUF - 1] = '\0';
         sprintf(fm_source_line, "Source: (none selected)");
         fm_dir_line[0] = '\0';
         strncpy(fm_source_btn_text, "Source", sizeof(fm_source_btn_text) - 1);
@@ -1494,10 +1536,12 @@ static void fm_refresh(const ProfileConfig *cfg)
 
     /* MOCK DATA -- see this file's own "Mock file/directory browser data"
      * block above; the real directory contents replace MOCK_FILES here in
-     * Step 2. */
+     * Step 2. Filename only, no size column: the whole point of the
+     * 76-character row width is showing the full (LFN) filename, per the
+     * task brief. */
     for (i = 0; i < FM_MAX_VISIBLE_FILES; i++) {
         if (have_active && i < MOCK_FILE_COUNT) {
-            sprintf(fm_row_text[i], "%-24.24s %6lu KB", MOCK_FILES[i].name, MOCK_FILES[i].size_kb);
+            sprintf(fm_row_text[i], "%.76s", MOCK_FILES[i].name);
             fm_dlg[FM_ROW(i)].ob_flags &= (unsigned short)(~HIDETREE);
         } else {
             fm_dlg[FM_ROW(i)].ob_flags |= (unsigned short)HIDETREE;
