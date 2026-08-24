@@ -1061,90 +1061,491 @@ static int server_selector_run(ProfileConfig *cfg)
 }
 
 /* ================================================================== */
-/* Main window (FM_*)                                                  */
+/* Mock file/directory browser data                                    */
+/*                                                                       */
+/* STEP 1.x PLACEHOLDER -- there is no real LFN directory browser yet    */
+/* (that is Step 2, see RESEARCH-STEP0.md sections 5/6/9). Everything in */
+/* this block, plus fm_refresh_files() and cd_refresh_rows() below (the  */
+/* only two functions that read it), exists purely so the main window's */
+/* and Change Dir dialog's selection/double-click/navigation UI can be   */
+/* built and tested now. Replacing this with real TNFS/SD directory      */
+/* results later should only ever require changing this block and the   */
+/* two loader functions -- nothing in the event-loop/selection code      */
+/* below should need to change.                                          */
 /* ================================================================== */
+typedef struct {
+    const char *name;
+    unsigned long size_kb;
+} MockFileEntry;
+
+static const MockFileEntry MOCK_FILES[] = {
+    { "ANOTHER_WORLD.ST",   800 },
+    { "DUNGEON_MASTER.ST",  720 },
+    { "LEMMINGS_DISK_1.ST", 800 },
+    { "LEMMINGS_DISK_2.ST", 800 },
+    { "LOTUS_TURBO.ST",     720 },
+    { "SPEEDBALL_II.ST",    800 },
+};
+#define MOCK_FILE_COUNT ((int)(sizeof(MOCK_FILES) / sizeof(MOCK_FILES[0])))
+
+/* Same mock subdirectory list is shown regardless of which directory the
+ * Change Dir dialog is actually in -- acceptable for a placeholder whose
+ * only job is exercising the navigate-up/navigate-down UI and the
+ * configured-root boundary check, not modeling a real directory tree. */
+static const char *MOCK_SUBDIRS[] = { "ARCADE", "DEMOS", "GAMES", "UTILITIES" };
+#define MOCK_SUBDIR_COUNT ((int)(sizeof(MOCK_SUBDIRS) / sizeof(MOCK_SUBDIRS[0])))
+
+/* ================================================================== */
+/* Profile source/path helpers                                         */
+/* ================================================================== */
+
+static const char *profile_backend_word(const Profile *p)
+{
+    return (p->backend == PROFILE_BACKEND_SD) ? "SD" : "TNFS";
+}
+
+/* The profile's own configured root -- mount_path for TNFS, sd_path for
+ * SD. The Change Dir dialog never lets the user navigate above this. */
+static void profile_root_dir(const Profile *p, char *out, int outsize)
+{
+    const char *root = (p->backend == PROFILE_BACKEND_SD) ? p->sd_path : p->mount_path;
+    strncpy(out, root, outsize - 1);
+    out[outsize - 1] = '\0';
+}
+
+/* The directory currently shown in the main window: last_directory if the
+ * profile has one, otherwise the configured root. */
+static void profile_current_dir(const Profile *p, char *out, int outsize)
+{
+    if (buf_nonempty(p->last_directory))
+        strncpy(out, p->last_directory, outsize - 1);
+    else
+        profile_root_dir(p, out, outsize);
+    out[outsize - 1] = '\0';
+}
+
+/* Appends "/name" to path, bounded to pathsize. */
+static void cd_path_push(char *path, int pathsize, const char *name)
+{
+    int len = (int)strlen(path);
+    if (len > 0 && path[len - 1] != '/' && len < pathsize - 1) {
+        path[len] = '/';
+        path[len + 1] = '\0';
+        len++;
+    }
+    strncat(path, name, (size_t)(pathsize - 1 - len));
+}
+
+/* Removes the last "/component" from path, never shortening it past
+ * root_dir -- the configured-root navigation boundary. */
+static void cd_path_pop(char *path, const char *root_dir)
+{
+    int len;
+    if (strcmp(path, root_dir) == 0)
+        return; /* already at root -- caller should not have offered ".." */
+
+    len = (int)strlen(path);
+    while (len > 0 && path[len - 1] == '/')
+        path[--len] = '\0';
+    while (len > 0 && path[len - 1] != '/')
+        path[--len] = '\0';
+    while (len > 1 && path[len - 1] == '/')
+        path[--len] = '\0';
+
+    if ((int)strlen(path) < (int)strlen(root_dir) || strncmp(path, root_dir, strlen(root_dir)) != 0)
+        strncpy(path, root_dir, PROFILE_LASTDIR_LEN - 1); /* safety clamp */
+}
+
+/* Generic double-click-aware click loop, shared by the main window's file
+ * list and the Change Dir dialog's directory list -- both need to detect
+ * a double-click on a row (form_do() alone never reports click count) and
+ * both use the same RBUTTON-family single-selection idiom for their rows.
+ * Honors EXIT-flagged buttons the normal way (returns their id,
+ * *out_double left 0); reports a click on any object in
+ * [row_base, row_base+row_count) via the return value with *out_double
+ * set from the AES click count, WITHOUT exiting the loop -- the caller
+ * decides what a single vs. double click on a row means. */
+static short list_dialog_click(OBJECT *tree, int root_id, int row_base, int row_count, int *out_double)
+{
+    short mx, my, mb, ks, kr, br;
+    short msg[8];
+    short event, obj, next;
+
+    for (;;) {
+        event = evnt_multi(MU_BUTTON,
+                           2, 1, 1,
+                           0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0,
+                           msg,
+                           0UL,
+                           &mx, &my, &mb, &ks, &kr, &br);
+        if (!(event & MU_BUTTON))
+            continue;
+
+        obj = objc_find(tree, root_id, MAX_DEPTH, mx, my);
+        if (obj <= 0)
+            continue;
+        if (tree[obj].ob_state & DISABLED)
+            continue; /* DISABLED rows (e.g. ".." at the configured root) are inert */
+
+        next = obj;
+        if (!form_button(tree, obj, br, &next)) {
+            short result = (short)(next & 0x7FFF);
+            if (result > 0)
+                tree[result].ob_state &= (unsigned short)(~SELECTED);
+            *out_double = 0;
+            return result;
+        }
+        if (obj >= row_base && obj < row_base + row_count) {
+            *out_double = (br >= 2);
+            return (short)obj;
+        }
+    }
+}
+
+/* ================================================================== */
+/* Change Dir dialog (CD_*)                                            */
+/* One directory level at a time: ".." (hidden when already at the       */
+/* profile's configured root) plus the mock subdirectory list. Single    */
+/* click selects a row; double-click or [Open] applies the selected row  */
+/* and closes; [Cancel] closes without changing anything. This is new UI */
+/* plumbing -- no dialog in the reused SIDETNFS-Config source material   */
+/* does a directory-only picker like this.                               */
+/* ================================================================== */
+#define CD_MAX_ROWS (1 + MOCK_SUBDIR_COUNT) /* ".." + mock subdirs */
+enum {
+    CD_ROOT = 0,
+    CD_TITLE,
+    CD_DIV1,
+    CD_ROW_BASE
+};
+#define CD_ROW(i)      (CD_ROW_BASE + (i))
+#define CD_AFTER_ROWS  (CD_ROW_BASE + CD_MAX_ROWS)
+#define CD_DIV2   (CD_AFTER_ROWS + 0)
+#define CD_OPEN   (CD_AFTER_ROWS + 1)
+#define CD_CANCEL (CD_AFTER_ROWS + 2)
+#define CD_NOBJS  (CD_AFTER_ROWS + 3)
+static OBJECT cd_dlg[CD_NOBJS];
+
+#define CD_ROW_BUF 32
+static char cd_row_text[CD_MAX_ROWS][CD_ROW_BUF];
+static int cd_selected_row; /* -1 = none; index into cd_row_text/CD_ROW() */
+
+static void cd_dialog_init(void)
+{
+    LayoutMetrics lm;
+    int DW, DH;
+    int yt, ydiv1, yrow0, ydiv2, ybtn;
+    int i;
+
+    layout_metrics_get(&lm);
+
+    DW = 30 * lm.cw;
+    yt    = lm.tm;
+    ydiv1 = yt + lm.rh + 1;
+    yrow0 = ydiv1 + 5;
+    ydiv2 = yrow0 + CD_MAX_ROWS * lm.pitch + 2;
+    ybtn  = ydiv2 + 7;
+    DH    = ybtn + lm.rh + lm.tm + 3;
+
+    set_obj(cd_dlg, CD_ROOT, G_BOX, NONE, NORMAL, 0, 0, DW, DH);
+    cd_dlg[CD_ROOT].ob_spec.index = 0x00031070L;
+
+    set_obj(cd_dlg, CD_TITLE, G_STRING, NONE, NORMAL, 8*lm.cw, yt, 14*lm.cw, lm.rh);
+    cd_dlg[CD_TITLE].ob_spec.free_string = "Change Directory";
+
+    set_obj(cd_dlg, CD_DIV1, G_BOX, NONE, NORMAL, lm.cw, ydiv1, DW - 2*lm.cw, 2);
+    cd_dlg[CD_DIV1].ob_spec.index = 0x00001171L;
+
+    for (i = 0; i < CD_MAX_ROWS; i++) {
+        int ry = yrow0 + i * lm.pitch;
+        set_obj(cd_dlg, CD_ROW(i), G_STRING, SELECTABLE | RBUTTON, NORMAL, lm.cw, ry, 28*lm.cw, lm.rh);
+        cd_dlg[CD_ROW(i)].ob_spec.free_string = cd_row_text[i];
+    }
+
+    set_obj(cd_dlg, CD_DIV2, G_BOX, NONE, NORMAL, lm.cw, ydiv2, DW - 2*lm.cw, 2);
+    cd_dlg[CD_DIV2].ob_spec.index = 0x00001171L;
+
+    set_obj(cd_dlg, CD_OPEN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 2*lm.cw, ybtn, 9*lm.cw, lm.rh);
+    cd_dlg[CD_OPEN].ob_spec.free_string = "  Open  ";
+
+    set_obj(cd_dlg, CD_CANCEL, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 18*lm.cw, ybtn, 9*lm.cw, lm.rh);
+    cd_dlg[CD_CANCEL].ob_spec.free_string = " Cancel ";
+
+    wire_tree(cd_dlg, CD_NOBJS);
+}
+
+/* Rebuilds the row list for the directory the dialog is about to show --
+ * called once when the dialog opens (see this file's header comment on
+ * "bij openen" for why this is a per-dialog-open rebuild, not a
+ * per-navigation one: this dialog is a single-level picker, not a
+ * multi-level drill-down browser). ".." stays visible but DISABLED when
+ * current_dir already equals the profile's configured root -- same
+ * "greyed out, not clickable, but no layout gap" convention
+ * SIDETNFS-Config's TE_DELETE uses for "not applicable to this slot"
+ * (RESEARCH-STEP0.md section 3.8) -- HIDETREE would leave every row below
+ * it sitting one slot too high with a blank gap at the top, since rows
+ * are never repositioned after being laid out. */
+static void cd_refresh_rows(const char *current_dir, const char *root_dir)
+{
+    int i;
+    int at_root = (strcmp(current_dir, root_dir) == 0);
+
+    strncpy(cd_row_text[0], "..", CD_ROW_BUF - 1);
+    cd_row_text[0][CD_ROW_BUF - 1] = '\0';
+    if (at_root)
+        cd_dlg[CD_ROW(0)].ob_state |= (unsigned short)DISABLED;
+    else
+        cd_dlg[CD_ROW(0)].ob_state &= (unsigned short)(~DISABLED);
+    cd_dlg[CD_ROW(0)].ob_state &= (unsigned short)(~SELECTED);
+
+    for (i = 0; i < MOCK_SUBDIR_COUNT; i++) {
+        sprintf(cd_row_text[i + 1], "%-.28s", MOCK_SUBDIRS[i]);
+        cd_dlg[CD_ROW(i + 1)].ob_state &= (unsigned short)(~(SELECTED | DISABLED));
+    }
+
+    cd_selected_row = -1;
+}
+
+/* Runs the Change Dir dialog against *current_dir (in/out, a
+ * PROFILE_LASTDIR_LEN buffer) bounded by root_dir. Returns 1 if the
+ * directory changed (caller should persist it to the active profile's
+ * last_directory and refresh the file list), 0 if cancelled. */
+static int cd_run(char *current_dir, const char *root_dir)
+{
+    DialogGeometry geo;
+    short which;
+    int is_double;
+    int done;
+    int changed = 0;
+
+    cd_dialog_init();
+    cd_refresh_rows(current_dir, root_dir);
+    dialog_open(cd_dlg, CD_ROOT, &geo);
+
+    done = 0;
+    while (!done) {
+        which = list_dialog_click(cd_dlg, CD_ROOT, CD_ROW_BASE, CD_MAX_ROWS, &is_double);
+
+        if (which >= CD_ROW_BASE && which < CD_AFTER_ROWS) {
+            cd_selected_row = which - CD_ROW_BASE;
+            if (is_double)
+                which = CD_OPEN; /* fall through to the Open handling below */
+            else
+                continue;
+        }
+
+        switch (which) {
+        case CD_OPEN:
+            if (cd_selected_row < 0)
+                break; /* nothing selected -- Open does nothing, matches Start's own rule */
+            /* Row 0 is always the ".." slot and row 1..MOCK_SUBDIR_COUNT
+             * are always the subdirs, regardless of at_root -- row 0 is
+             * merely DISABLED (never clickable, see cd_refresh_rows())
+             * when already at root, not removed from the layout, so this
+             * mapping never shifts. */
+            if (cd_selected_row == 0) {
+                cd_path_pop(current_dir, root_dir);
+            } else {
+                int subdir_index = cd_selected_row - 1;
+                if (subdir_index >= 0 && subdir_index < MOCK_SUBDIR_COUNT)
+                    cd_path_push(current_dir, PROFILE_LASTDIR_LEN, MOCK_SUBDIRS[subdir_index]);
+            }
+            changed = 1;
+            done = 1;
+            break;
+
+        case CD_CANCEL:
+        default:
+            done = 1;
+            break;
+        }
+    }
+
+    dialog_close(&geo);
+    return changed;
+}
+
+/* ================================================================== */
+/* Main window (FM_*)                                                  */
+/* The central hub: shown immediately at startup (see dialog_run()) and  */
+/* returned to after every Source/Change Dir/Start action -- never an    */
+/* intermediate "pick a source first" gate. Source and Change Dir open   */
+/* the already-existing selector/editor dialogs directly; there is no    */
+/* separate chooser dialog of its own anymore.                           */
+/* ================================================================== */
+#define FM_MAX_VISIBLE_FILES 10 /* placeholder count for the mock data above; the real
+                                  * browser (Step 2) pages at 25 entries (RESEARCH-STEP0.md) */
 enum {
     FM_ROOT = 0,
     FM_TITLE,
     FM_DIV1,
-    FM_ACTIVE_LBL, FM_ACTIVE_VAL,
+    FM_SOURCE_LINE,
+    FM_DIR_LINE,
     FM_DIV2,
-    FM_SERVER, FM_QUIT,
-    FM_NOBJS
+    FM_ROW_BASE
 };
+#define FM_ROW(i)      (FM_ROW_BASE + (i))
+#define FM_AFTER_ROWS  (FM_ROW_BASE + FM_MAX_VISIBLE_FILES)
+#define FM_DIV3          (FM_AFTER_ROWS + 0)
+#define FM_SOURCE_BTN    (FM_AFTER_ROWS + 1)
+#define FM_CHANGEDIR_BTN (FM_AFTER_ROWS + 2)
+#define FM_START_BTN     (FM_AFTER_ROWS + 3)
+#define FM_QUIT_BTN      (FM_AFTER_ROWS + 4)
+#define FM_NOBJS         (FM_AFTER_ROWS + 5)
 static OBJECT fm_dlg[FM_NOBJS];
 
-#define FM_ACTIVE_BUF 28
-static char fm_active_val[FM_ACTIVE_BUF];
+#define FM_SOURCE_BUF 48 /* "Source: " (8) + nickname (20) + "   Type: " (9) + backend word (up to 4) + NUL = 42 */
+#define FM_DIR_BUF    56
+#define FM_ROW_BUF    40
+static char fm_source_line[FM_SOURCE_BUF];
+static char fm_dir_line[FM_DIR_BUF];
+static char fm_row_text[FM_MAX_VISIBLE_FILES][FM_ROW_BUF];
+#define FM_SOURCE_BTN_BUF 16
+static char fm_source_btn_text[FM_SOURCE_BTN_BUF]; /* "Source: TNFS" / "Source: SD" -- own text doubles as the value, same idiom as Active/Source toggles elsewhere */
+static int fm_selected_row = -1; /* -1 = no file selected */
 
 static void fm_dialog_init(void)
 {
     LayoutMetrics lm;
     int DW, DH;
-    int yt, ydiv1, yactive, ydiv2, ybtn;
+    int yt, ydiv1, ysource, ydir, ydiv2, yrow0, ydiv3, ybtn;
+    int i;
 
     layout_metrics_get(&lm);
 
-    DW = 36 * lm.cw;
+    DW = 50 * lm.cw;
     yt      = lm.tm;
     ydiv1   = yt + lm.rh + 1;
-    yactive = ydiv1 + 5;
-    ydiv2   = yactive + lm.rh + 2;
-    ybtn    = ydiv2 + 7;
+    ysource = ydiv1 + 5;
+    ydir    = ysource + lm.pitch;
+    ydiv2   = ydir + lm.rh + 2;
+    yrow0   = ydiv2 + 5;
+    ydiv3   = yrow0 + FM_MAX_VISIBLE_FILES * lm.pitch + 2;
+    ybtn    = ydiv3 + 7;
     DH      = ybtn + lm.rh + lm.tm + 3;
 
     set_obj(fm_dlg, FM_ROOT, G_BOX, NONE, NORMAL, 0, 0, DW, DH);
     fm_dlg[FM_ROOT].ob_spec.index = 0x00031070L;
 
-    set_obj(fm_dlg, FM_TITLE, G_STRING, NONE, NORMAL, 12*lm.cw, yt, 12*lm.cw, lm.rh);
+    set_obj(fm_dlg, FM_TITLE, G_STRING, NONE, NORMAL, 20*lm.cw, yt, 12*lm.cw, lm.rh);
     fm_dlg[FM_TITLE].ob_spec.free_string = "FLOPPY.PRG";
 
     set_obj(fm_dlg, FM_DIV1, G_BOX, NONE, NORMAL, lm.cw, ydiv1, DW - 2*lm.cw, 2);
     fm_dlg[FM_DIV1].ob_spec.index = 0x00001171L;
 
-    set_obj(fm_dlg, FM_ACTIVE_LBL, G_STRING, NONE, NORMAL, lm.cw, yactive, 15*lm.cw, lm.rh);
-    fm_dlg[FM_ACTIVE_LBL].ob_spec.free_string = "Active server:";
-    set_obj(fm_dlg, FM_ACTIVE_VAL, G_STRING, NONE, NORMAL, 16*lm.cw, yactive, 18*lm.cw, lm.rh);
-    fm_dlg[FM_ACTIVE_VAL].ob_spec.free_string = fm_active_val;
+    set_obj(fm_dlg, FM_SOURCE_LINE, G_STRING, NONE, NORMAL, lm.cw, ysource, 46*lm.cw, lm.rh);
+    fm_dlg[FM_SOURCE_LINE].ob_spec.free_string = fm_source_line;
+
+    set_obj(fm_dlg, FM_DIR_LINE, G_STRING, NONE, NORMAL, lm.cw, ydir, 46*lm.cw, lm.rh);
+    fm_dlg[FM_DIR_LINE].ob_spec.free_string = fm_dir_line;
 
     set_obj(fm_dlg, FM_DIV2, G_BOX, NONE, NORMAL, lm.cw, ydiv2, DW - 2*lm.cw, 2);
     fm_dlg[FM_DIV2].ob_spec.index = 0x00001171L;
 
-    set_obj(fm_dlg, FM_SERVER, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 4*lm.cw, ybtn, 14*lm.cw, lm.rh);
-    fm_dlg[FM_SERVER].ob_spec.free_string = "[S]erver";
+    for (i = 0; i < FM_MAX_VISIBLE_FILES; i++) {
+        int ry = yrow0 + i * lm.pitch;
+        set_obj(fm_dlg, FM_ROW(i), G_STRING, SELECTABLE | RBUTTON, NORMAL, lm.cw, ry, 46*lm.cw, lm.rh);
+        fm_dlg[FM_ROW(i)].ob_spec.free_string = fm_row_text[i];
+    }
 
-    set_obj(fm_dlg, FM_QUIT, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 20*lm.cw, ybtn, 12*lm.cw, lm.rh);
-    fm_dlg[FM_QUIT].ob_spec.free_string = "  Quit  ";
+    set_obj(fm_dlg, FM_DIV3, G_BOX, NONE, NORMAL, lm.cw, ydiv3, DW - 2*lm.cw, 2);
+    fm_dlg[FM_DIV3].ob_spec.index = 0x00001171L;
+
+    set_obj(fm_dlg, FM_SOURCE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 2*lm.cw, ybtn, 13*lm.cw, lm.rh);
+    fm_dlg[FM_SOURCE_BTN].ob_spec.free_string = fm_source_btn_text;
+
+    set_obj(fm_dlg, FM_CHANGEDIR_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 16*lm.cw, ybtn, 13*lm.cw, lm.rh);
+    fm_dlg[FM_CHANGEDIR_BTN].ob_spec.free_string = " Change Dir ";
+
+    set_obj(fm_dlg, FM_START_BTN, G_BUTTON, EXIT | DEFAULT | TOUCHEXIT, NORMAL, 30*lm.cw, ybtn, 9*lm.cw, lm.rh);
+    fm_dlg[FM_START_BTN].ob_spec.free_string = "  Start  ";
+
+    set_obj(fm_dlg, FM_QUIT_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 40*lm.cw, ybtn, 8*lm.cw, lm.rh);
+    fm_dlg[FM_QUIT_BTN].ob_spec.free_string = " Quit  ";
 
     wire_tree(fm_dlg, FM_NOBJS);
 }
 
+/* Repopulates the source/directory lines and the (mock) file list, and
+ * always clears any file selection -- called on startup and after every
+ * Source/Change Dir action, per the task brief's "wis een eventueel
+ * geselecteerd image... maak Start opnieuw inactief" rule. */
 static void fm_refresh(const ProfileConfig *cfg)
 {
     const Profile *p;
+    char dir[PROFILE_LASTDIR_LEN];
+    int i;
+    int have_active = (cfg->active_index >= 0 && cfg->active_index < MAX_PROFILES
+                        && profile_slot_is_configured(&cfg->profiles[cfg->active_index]));
 
-    if (cfg->active_index >= 0 && cfg->active_index < MAX_PROFILES
-        && profile_slot_is_configured(&cfg->profiles[cfg->active_index])) {
+    if (have_active) {
         p = &cfg->profiles[cfg->active_index];
-        sprintf(fm_active_val, "%-.20s", p->nickname);
+        sprintf(fm_source_line, "Source: %-.20s   Type: %s", p->nickname, profile_backend_word(p));
+        profile_current_dir(p, dir, sizeof(dir));
+        sprintf(fm_dir_line, "Directory: %-.34s", dir);
+        sprintf(fm_source_btn_text, "Source: %s", profile_backend_word(p));
     } else {
-        sprintf(fm_active_val, "(none selected)");
+        sprintf(fm_source_line, "Source: (none selected)");
+        fm_dir_line[0] = '\0';
+        strncpy(fm_source_btn_text, "Source", sizeof(fm_source_btn_text) - 1);
+        fm_source_btn_text[sizeof(fm_source_btn_text) - 1] = '\0';
     }
+
+    /* MOCK DATA -- see this file's own "Mock file/directory browser data"
+     * block above; the real directory contents replace MOCK_FILES here in
+     * Step 2. */
+    for (i = 0; i < FM_MAX_VISIBLE_FILES; i++) {
+        if (have_active && i < MOCK_FILE_COUNT) {
+            sprintf(fm_row_text[i], "%-24.24s %6lu KB", MOCK_FILES[i].name, MOCK_FILES[i].size_kb);
+            fm_dlg[FM_ROW(i)].ob_flags &= (unsigned short)(~HIDETREE);
+        } else {
+            fm_dlg[FM_ROW(i)].ob_flags |= (unsigned short)HIDETREE;
+        }
+        fm_dlg[FM_ROW(i)].ob_state &= (unsigned short)(~SELECTED);
+    }
+    fm_selected_row = -1;
 }
 
-/* Custom event loop instead of form_do(), adapted directly from
- * SIDETNFS-Config's sw_form_do_ticking() (the one place that codebase
- * already needed something other than form_do() to add an extra keyboard
- * shortcut) -- here to add the 'S' shortcut for [Server], per the task
- * brief, without inventing an unproven keyboard-handling mechanism. No
- * timer tick is needed here (unlike sw_form_do_ticking()'s clock), so
- * MU_TIMER is left out of the event mask entirely. */
-static short fm_form_do_events(void)
+/* STEP 1.x STUB -- there is no floppy mount/emulation yet (explicitly out
+ * of scope, see RESEARCH-STEP0.md). Builds the full source+directory+
+ * filename path (no GEMDOS 8.3 shortening -- these are plain C strings,
+ * never touched by GEMDOS) and reports what would be started. Deliberately
+ * kept to exactly the inputs a real "send the selection to the Pico"
+ * command will need (source/backend + directory + filename), so wiring up
+ * the real command later should not require changing this function's
+ * shape, only its body. */
+static void fm_start_selected(const ProfileConfig *cfg)
+{
+    const Profile *p;
+    char dir[PROFILE_LASTDIR_LEN];
+    char msg[400];
+
+    if (fm_selected_row < 0 || fm_selected_row >= MOCK_FILE_COUNT)
+        return; /* Start with no selection: do nothing, matches the task brief */
+
+    p = &cfg->profiles[cfg->active_index];
+    profile_current_dir(p, dir, sizeof(dir));
+
+    sprintf(msg, "[1][Would start:|%-.20s (%s)|%-.60s/|%-.30s][OK]",
+            p->nickname, profile_backend_word(p), dir, MOCK_FILES[fm_selected_row].name);
+    form_alert(1, msg);
+}
+
+/* Custom event loop instead of form_do(): needed for two things form_do()
+ * alone cannot provide -- up/down arrow-key list navigation, and (via
+ * list_dialog_click()) double-click detection on a file row. Adapted from
+ * the same evnt_multi()-based pattern SIDETNFS-Config's
+ * sw_form_do_ticking() already established as this codebase's way to add
+ * behavior beyond form_do()'s defaults. */
+static short fm_form_do_events(const DialogGeometry *geo, int *out_double)
 {
     short mx, my, mb, ks, kr, br;
     short msg[8];
     short event, obj, next;
     short result = -1;
+
+    *out_double = 0;
 
     while (result == -1) {
         event = evnt_multi(MU_KEYBD | MU_BUTTON,
@@ -1163,14 +1564,36 @@ static short fm_form_do_events(void)
                     result = (short)(next & 0x7FFF);
                     if (result > 0 && result < FM_NOBJS)
                         fm_dlg[result].ob_state &= (unsigned short)(~SELECTED);
+                } else if (obj >= FM_ROW_BASE && obj < FM_AFTER_ROWS) {
+                    *out_double = (br >= 2);
+                    result = obj;
                 }
             }
         }
 
         if (event & MU_KEYBD) {
-            int c = kr & 0x00FF;
-            if (c == 's' || c == 'S')
-                result = FM_SERVER;
+            /* Standard AT/Atari keyboard scan codes, same convention the
+             * old sidecart-configurator-atari project used for cursor
+             * keys (KEY_UP_ARROW/KEY_DOWN_ARROW, helper.h) -- kr's high
+             * byte is the scan code, low byte the ASCII value (0 for
+             * non-ASCII keys like the arrows). */
+            int scan = (kr >> 8) & 0x00FF;
+            int visible_count = (MOCK_FILE_COUNT < FM_MAX_VISIBLE_FILES) ? MOCK_FILE_COUNT : FM_MAX_VISIBLE_FILES;
+
+            if (visible_count > 0 && (scan == 0x48 || scan == 0x50)) { /* up / down */
+                int new_row = fm_selected_row;
+                if (scan == 0x48) /* up */
+                    new_row = (new_row <= 0) ? 0 : new_row - 1;
+                else /* down */
+                    new_row = (new_row < 0) ? 0 : ((new_row + 1 >= visible_count) ? visible_count - 1 : new_row + 1);
+
+                if (fm_selected_row >= 0)
+                    fm_dlg[FM_ROW(fm_selected_row)].ob_state &= (unsigned short)(~SELECTED);
+                fm_dlg[FM_ROW(new_row)].ob_state |= (unsigned short)SELECTED;
+                fm_selected_row = new_row;
+                objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo->x, geo->y, geo->w, geo->h);
+                /* result stays -1: handled here, keep looping */
+            }
         }
     }
 
@@ -1182,7 +1605,11 @@ void dialog_run(ProfileConfig *cfg)
     DialogGeometry geo;
     short which;
     int done;
+    int is_double;
     int selector_result;
+    char dir[PROFILE_LASTDIR_LEN];
+    char root[PROFILE_LASTDIR_LEN];
+    const Profile *p;
 
     shared_fields_init();
 
@@ -1196,10 +1623,18 @@ void dialog_run(ProfileConfig *cfg)
 
     done = 0;
     while (!done) {
-        which = fm_form_do_events();
+        which = fm_form_do_events(&geo, &is_double);
+
+        if (which >= FM_ROW_BASE && which < FM_AFTER_ROWS) {
+            fm_selected_row = which - FM_ROW_BASE;
+            objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            if (is_double)
+                fm_start_selected(cfg);
+            continue;
+        }
 
         switch (which) {
-        case FM_SERVER:
+        case FM_SOURCE_BTN:
             selector_result = server_selector_run(cfg);
             if (selector_result == 2)
                 edit_servers_run(cfg);
@@ -1207,7 +1642,31 @@ void dialog_run(ProfileConfig *cfg)
             objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
             break;
 
-        case FM_QUIT:
+        case FM_CHANGEDIR_BTN:
+            if (cfg->active_index >= 0 && cfg->active_index < MAX_PROFILES
+                && profile_slot_is_configured(&cfg->profiles[cfg->active_index])) {
+                p = &cfg->profiles[cfg->active_index];
+                profile_current_dir(p, dir, sizeof(dir));
+                profile_root_dir(p, root, sizeof(root));
+                if (cd_run(dir, root)) {
+                    strncpy(cfg->profiles[cfg->active_index].last_directory, dir, PROFILE_LASTDIR_LEN - 1);
+                    cfg->profiles[cfg->active_index].last_directory[PROFILE_LASTDIR_LEN - 1] = '\0';
+                    fm_refresh(cfg);
+                }
+            } else {
+                form_alert(1, "[3][No source selected.][OK]");
+            }
+            objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            break;
+
+        case FM_START_BTN:
+            if (fm_selected_row < 0)
+                form_alert(1, "[3][No image selected.][OK]");
+            else
+                fm_start_selected(cfg);
+            break;
+
+        case FM_QUIT_BTN:
         default:
             done = 1;
             break;
