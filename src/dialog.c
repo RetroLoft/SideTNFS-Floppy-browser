@@ -1404,7 +1404,10 @@ enum {
     FM_TITLE,
     FM_DIV1,
     FM_SOURCE_LINE,
-    FM_DIR_LINE,
+    /* No separate "Directory: X" line here -- FM_TITLE already IS the
+     * current directory, so this would only ever duplicate it (and, when
+     * empty/no source selected, left a blank row that pushed the buttons
+     * partly off-screen on real hardware). */
     FM_DIV2,
     FM_ROW_BASE
 };
@@ -1429,11 +1432,9 @@ static OBJECT fm_dlg[FM_NOBJS];
 
 #define FM_TITLE_BUF  FM_DIALOG_CHARS
 #define FM_SOURCE_BUF 48 /* "Source: " (8) + nickname (20) + "   Type: " (9) + backend word (up to 4) + NUL = 42 */
-#define FM_DIR_BUF    (11 + FM_CONTENT_CHARS + 1) /* "Directory: " + up to FM_CONTENT_CHARS + NUL */
 #define FM_ROW_BUF    (FM_CONTENT_CHARS + 1)      /* up to FM_CONTENT_CHARS of filename + NUL */
 static char fm_title_text[FM_TITLE_BUF]; /* current directory (or a placeholder) -- see fm_refresh() */
 static char fm_source_line[FM_SOURCE_BUF];
-static char fm_dir_line[FM_DIR_BUF];
 static char fm_row_text[FM_MAX_VISIBLE_FILES][FM_ROW_BUF];
 #define FM_SOURCE_BTN_BUF 16
 static char fm_source_btn_text[FM_SOURCE_BTN_BUF]; /* "Source: TNFS" / "Source: SD" -- own text doubles as the value, same idiom as Active/Source toggles elsewhere */
@@ -1443,7 +1444,7 @@ static void fm_dialog_init(void)
 {
     LayoutMetrics lm;
     int DW, DH;
-    int yt, ydiv1, ysource, ydir, ydiv2, yrow0, ydiv3, ybtn;
+    int yt, ydiv1, ysource, ydiv2, yrow0, ydiv3, ybtn;
     int i;
 
     layout_metrics_get(&lm);
@@ -1452,8 +1453,7 @@ static void fm_dialog_init(void)
     yt      = lm.tm;
     ydiv1   = yt + lm.rh + 1;
     ysource = ydiv1 + 5;
-    ydir    = ysource + lm.pitch;
-    ydiv2   = ydir + lm.rh + 2;
+    ydiv2   = ysource + lm.rh + 2;
     yrow0   = ydiv2 + 5;
     ydiv3   = yrow0 + FM_MAX_VISIBLE_FILES * lm.pitch + 2;
     ybtn    = ydiv3 + 7;
@@ -1474,9 +1474,6 @@ static void fm_dialog_init(void)
 
     set_obj(fm_dlg, FM_SOURCE_LINE, G_STRING, NONE, NORMAL, lm.cw, ysource, FM_CONTENT_CHARS*lm.cw, lm.rh);
     fm_dlg[FM_SOURCE_LINE].ob_spec.free_string = fm_source_line;
-
-    set_obj(fm_dlg, FM_DIR_LINE, G_STRING, NONE, NORMAL, lm.cw, ydir, FM_CONTENT_CHARS*lm.cw, lm.rh);
-    fm_dlg[FM_DIR_LINE].ob_spec.free_string = fm_dir_line;
 
     set_obj(fm_dlg, FM_DIV2, G_BOX, NONE, NORMAL, lm.cw, ydiv2, DW - 2*lm.cw, 2);
     fm_dlg[FM_DIV2].ob_spec.index = 0x00001171L;
@@ -1524,7 +1521,6 @@ static void fm_refresh(const ProfileConfig *cfg)
          * own comment on why this replaced a static "FLOPPY.PRG" title. */
         sprintf(fm_title_text, "%.76s", dir);
         sprintf(fm_source_line, "Source: %-.20s   Type: %s", p->nickname, profile_backend_word(p));
-        sprintf(fm_dir_line, "Directory: %-.65s", dir);
         sprintf(fm_source_btn_text, "Source: %s", profile_backend_word(p));
     } else {
         /* No profile configured yet -- "/Floppies" is the placeholder
@@ -1533,7 +1529,6 @@ static void fm_refresh(const ProfileConfig *cfg)
         strncpy(fm_title_text, "/Floppies", FM_TITLE_BUF - 1);
         fm_title_text[FM_TITLE_BUF - 1] = '\0';
         sprintf(fm_source_line, "Source: (none selected)");
-        fm_dir_line[0] = '\0';
         strncpy(fm_source_btn_text, "Source", sizeof(fm_source_btn_text) - 1);
         fm_source_btn_text[sizeof(fm_source_btn_text) - 1] = '\0';
     }
