@@ -1390,15 +1390,15 @@ static int cd_run(char *current_dir, const char *root_dir)
 /* the already-existing selector/editor dialogs directly; there is no    */
 /* separate chooser dialog of its own anymore.                           */
 /* ================================================================== */
-/* 20, not the LFN browser's own 25-per-page figure (RESEARCH-STEP0.md) --
+/* 16, not the LFN browser's own 25-per-page figure (RESEARCH-STEP0.md) --
  * 25 rows plus the title/source/directory lines and buttons made this
  * dialog taller than a real 640x200 medium-resolution screen (~223px
- * needed vs. 200px available). 20 rows brings that back under budget
- * (~188px) while medium/high resolution are both still supported. If a
+ * needed vs. 200px available); 20 rows (~188px) still fit but left little
+ * margin. 16 rows gives comfortable headroom on medium resolution. If a
  * real 25-entry page is needed later, this will need either a scrollable
  * list or a resolution-dependent row count, not just raising this
  * constant back up. */
-#define FM_MAX_VISIBLE_FILES 20
+#define FM_MAX_VISIBLE_FILES 16
 enum {
     FM_ROOT = 0,
     FM_TITLE,
