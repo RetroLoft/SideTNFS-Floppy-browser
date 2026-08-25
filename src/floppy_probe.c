@@ -280,3 +280,163 @@ int floppy_probe_save_profiles(unsigned long *out_status)
     *out_status = rom3_read_long(PROFILE_STATUS_OFFSET);
     return FLOPPY_PROBE_OK;
 }
+
+/* ------------------------------------------------------------------
+ * Step 2 -- real LFN directory browser (GEMDRVEMUL_FLOPPY_BROWSE_*,
+ * subcommands 0x23-0x26). Offsets below are hand-walked from
+ * gemdrvemul.h's own GEMDRVEMUL_FLOPPY_BROWSE/_PAGE macro chain
+ * (floppyemu branch, SIDETNFS_NETWORK_ALIGN4-rounded, immediately after
+ * GEMDRVEMUL_FLOPPY_PROFILE which ends at PROFILE_SD_PATH_OFFSET+256 =
+ * 0x482E) -- not independently guessed. GET_*_PAGE's entries region
+ * (6400 bytes) is read byte-for-byte in address order, same convention
+ * read_string_field() already uses for every other Pico->Atari string
+ * field in this protocol -- no unswap needed on this side (see this
+ * file's own top-of-file byte-order summary). */
+#define CMD_FLOPPY_BROWSE_OPEN        0x0423UL
+#define CMD_FLOPPY_BROWSE_CHANGE_DIR  0x0424UL
+#define CMD_FLOPPY_BROWSE_GET_DIR_PAGE  0x0425UL
+#define CMD_FLOPPY_BROWSE_GET_FILE_PAGE 0x0426UL
+
+#define BROWSE_STATUS_OFFSET     0x4830UL /* uint32_t */
+#define BROWSE_GENERATION_OFFSET 0x4834UL /* uint32_t */
+#define BROWSE_CWD_OFFSET        0x4838UL /* char[FLOPPY_BROWSE_CWD_LEN] -- block ends 0x4938 */
+
+#define PAGE_STATUS_OFFSET     0x4938UL /* uint32_t */
+#define PAGE_GENERATION_OFFSET 0x493CUL /* uint32_t */
+#define PAGE_INDEX_OFFSET      0x4940UL /* uint32_t */
+#define PAGE_COUNT_OFFSET      0x4944UL /* uint16_t */
+#define PAGE_HAS_PREV_OFFSET   0x4946UL /* uint16_t */
+#define PAGE_HAS_NEXT_OFFSET   0x4948UL /* uint16_t */
+#define PAGE_ENTRIES_OFFSET    0x494CUL /* char[FLOPPY_BROWSE_PAGE_ENTRIES][FLOPPY_BROWSE_NAME_LEN] -- block ends 0x624C */
+
+/* BROWSE_CHANGE_DIR request payload size, excluding the 4-byte token:
+ * generation(4) + go_up(2) + name(FLOPPY_BROWSE_NAME_LEN=256) = 262 bytes. */
+#define BROWSE_CHANGE_DIR_PAYLOAD_BYTES (4UL + 2UL + (unsigned long)FLOPPY_BROWSE_NAME_LEN)
+
+static void read_browse_result(FloppyBrowseResult *out)
+{
+    out->status     = rom3_read_long(BROWSE_STATUS_OFFSET);
+    out->generation = rom3_read_long(BROWSE_GENERATION_OFFSET);
+    read_string_field(BROWSE_CWD_OFFSET, out->cwd, FLOPPY_BROWSE_CWD_LEN);
+}
+
+static void read_page_result(FloppyPageResult *out)
+{
+    unsigned int i;
+
+    out->status     = rom3_read_long(PAGE_STATUS_OFFSET);
+    out->generation = rom3_read_long(PAGE_GENERATION_OFFSET);
+    out->page_index = rom3_read_long(PAGE_INDEX_OFFSET);
+    out->count      = rom3_read_word(PAGE_COUNT_OFFSET);
+    out->has_prev   = rom3_read_word(PAGE_HAS_PREV_OFFSET);
+    out->has_next   = rom3_read_word(PAGE_HAS_NEXT_OFFSET);
+
+    for (i = 0; i < FLOPPY_BROWSE_PAGE_ENTRIES; i++) {
+        read_string_field(PAGE_ENTRIES_OFFSET + (unsigned long)i * FLOPPY_BROWSE_NAME_LEN,
+                           out->entries[i], FLOPPY_BROWSE_NAME_LEN);
+    }
+}
+
+int floppy_probe_browse_open(unsigned long profile_index, FloppyBrowseResult *out)
+{
+    unsigned long seed = send_command_start(CMD_FLOPPY_BROWSE_OPEN, 4UL);
+    send_param32(profile_index);
+
+    if (!wait_for_token(seed, PROBE_TIMEOUT_SEC))
+        return FLOPPY_PROBE_TIMEOUT;
+
+    read_browse_result(out);
+    return FLOPPY_PROBE_OK;
+}
+
+int floppy_probe_browse_change_dir(unsigned long generation, int go_up, const char *name, FloppyBrowseResult *out)
+{
+    char name_buf[FLOPPY_BROWSE_NAME_LEN];
+    unsigned long seed;
+    int i;
+
+    /* send_string_field() reads exactly FLOPPY_BROWSE_NAME_LEN bytes from
+     * its source -- pad with NULs past name's own terminator so nothing
+     * past the caller's buffer is ever read. */
+    for (i = 0; i < FLOPPY_BROWSE_NAME_LEN; i++) {
+        name_buf[i] = (name != (const char *)0) ? name[i] : '\0';
+        if (name_buf[i] == '\0')
+            break;
+    }
+    for (; i < FLOPPY_BROWSE_NAME_LEN; i++)
+        name_buf[i] = '\0';
+
+    seed = send_command_start(CMD_FLOPPY_BROWSE_CHANGE_DIR, BROWSE_CHANGE_DIR_PAYLOAD_BYTES);
+    send_param32(generation);
+    send_param16(go_up ? 1UL : 0UL);
+    send_string_field(name_buf, FLOPPY_BROWSE_NAME_LEN);
+
+    if (!wait_for_token(seed, PROBE_TIMEOUT_SEC))
+        return FLOPPY_PROBE_TIMEOUT;
+
+    read_browse_result(out);
+    return FLOPPY_PROBE_OK;
+}
+
+/* One GET_*_PAGE round trip. The firmware never blocks for long inside a
+ * single call any more (SideTNFS-Firmware/romemul/include/
+ * sidetnfs_floppy_browse.h: a TNFS walk only does a small, bounded number
+ * of real network round trips per call), so PROBE_TIMEOUT_SEC is ample
+ * headroom for THIS one call -- it is not the overall "is the page ready
+ * yet" budget, see browse_get_page_poll() below for that. */
+static int browse_get_page_once(unsigned long command, unsigned long generation, unsigned long page_index,
+                                 FloppyPageResult *out)
+{
+    unsigned long seed = send_command_start(command, 8UL);
+    send_param32(generation);
+    send_param32(page_index);
+
+    if (!wait_for_token(seed, PROBE_TIMEOUT_SEC))
+        return FLOPPY_PROBE_TIMEOUT;
+
+    read_page_result(out);
+    return FLOPPY_PROBE_OK;
+}
+
+/* Overall budget across every resumed poll for ONE page fetch (not any
+ * single round trip's own PROBE_TIMEOUT_SEC) -- generous enough for a
+ * large directory walked a handful of TNFS entries at a time per poll. */
+#define PAGE_POLL_TIMEOUT_SEC 30
+
+/* Re-issues the IDENTICAL GET_*_PAGE request (same command/generation/
+ * page_index) for as long as the firmware reports
+ * FLOPPY_BROWSE_STATUS_IN_PROGRESS -- see sidetnfs_floppy_browse.h's own
+ * contract: the firmware never finishes a deep/slow TNFS walk inside one
+ * blocking call, so the Atari side is the one that keeps asking "is it
+ * ready yet" instead. Transparent to every caller of
+ * floppy_probe_browse_get_dir_page()/_get_file_page() -- out->status is
+ * never FLOPPY_BROWSE_STATUS_IN_PROGRESS by the time this returns
+ * FLOPPY_PROBE_OK. */
+static int browse_get_page_poll(unsigned long command, unsigned long generation, unsigned long page_index,
+                                 FloppyPageResult *out)
+{
+    long budget = (long)PAGE_POLL_TIMEOUT_SEC * PAL_VBLS_PER_SEC;
+    int rc;
+
+    for (;;) {
+        rc = browse_get_page_once(command, generation, page_index, out);
+        if (rc != FLOPPY_PROBE_OK)
+            return rc;
+        if (out->status != FLOPPY_BROWSE_STATUS_IN_PROGRESS)
+            return FLOPPY_PROBE_OK;
+        if (budget <= 0)
+            return FLOPPY_PROBE_TIMEOUT;
+        Vsync();
+        budget--;
+    }
+}
+
+int floppy_probe_browse_get_dir_page(unsigned long generation, unsigned long page_index, FloppyPageResult *out)
+{
+    return browse_get_page_poll(CMD_FLOPPY_BROWSE_GET_DIR_PAGE, generation, page_index, out);
+}
+
+int floppy_probe_browse_get_file_page(unsigned long generation, unsigned long page_index, FloppyPageResult *out)
+{
+    return browse_get_page_poll(CMD_FLOPPY_BROWSE_GET_FILE_PAGE, generation, page_index, out);
+}

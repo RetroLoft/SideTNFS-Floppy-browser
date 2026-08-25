@@ -149,6 +149,11 @@ typedef struct {
     int   rh;      /* row height (possibly shrunk for short screens) */
     int   tm;      /* top/edge margin */
     int   pitch;   /* row pitch = rh + a small gap, for multi-row dialogs */
+    int   short_screen; /* 1 on a medium-res-height (<350px) screen -- see fm_dialog_init()'s own use */
+    int   sw, sh;  /* real screen work-area width/height, pixels (wind_get WF_WORKXYWH) -- see fm_dialog_init()'s
+                    * short-screen layout: char-multiples of cw/ch are only an ESTIMATE of screen size (a system
+                    * font's actual cw is not guaranteed to be 8px), so the main window's own full-width/fullscreen
+                    * layout on a short screen measures directly against these instead of guessing from cw. */
 } LayoutMetrics;
 
 static void layout_metrics_get(LayoutMetrics *lm)
@@ -159,12 +164,16 @@ static void layout_metrics_get(LayoutMetrics *lm)
     graf_handle(&lm->cw, &lm->ch, &bw, &bh);
     wind_get(0, WF_WORKXYWH, &sx, &sy, &sw, &sh);
     if (sh <= 0 || sh > 800) sh = 200;
+    if (sw <= 0 || sw > 1280) sw = 640;
 
+    lm->short_screen = (sh < 350);
     lm->rh    = (sh >= 350) ? (int)lm->ch : ((lm->ch > 8) ? lm->ch / 2 : (int)lm->ch);
     lm->tm    = (lm->rh / 4 > 2) ? lm->rh / 4 : 2;
     lm->pitch = lm->rh + 3;
+    lm->sw    = sw;
+    lm->sh    = sh;
 
-    (void)sx; (void)sy; (void)sw; (void)bw; (void)bh;
+    (void)sx; (void)sy; (void)bw; (void)bh;
 }
 
 /* The "run a modal dialog" open/close halves of the 5-step sequence every
@@ -176,9 +185,27 @@ static void layout_metrics_get(LayoutMetrics *lm)
  * truly identical everywhere, so only those are factored here. */
 typedef struct { short x, y, w, h; } DialogGeometry;
 
-static void dialog_open(OBJECT *tree, int root_id, DialogGeometry *geo)
+/* flush_topleft: 0 (every existing caller) keeps the normal
+ * form_center()-computed, screen-centered position. 1 (the main window
+ * only, and only on a medium-res-height screen -- see dialog_run()) opens
+ * flush against the top-left corner instead, at the tree's own already-
+ * set ROOT width/height: on a screen just barely too short for the
+ * dialog's content, centering wastes an equal margin above AND below that
+ * pushes the bottom (the button row) off-screen, whereas flush-top uses
+ * every available pixel from y=0 down. This does not change the dialog's
+ * own computed height -- if that alone still exceeds the physical screen
+ * height, the very bottom stays clipped either way; it only reclaims the
+ * margin form_center() would otherwise have wasted. */
+static void dialog_open(OBJECT *tree, int root_id, DialogGeometry *geo, int flush_topleft)
 {
-    form_center(tree, &geo->x, &geo->y, &geo->w, &geo->h);
+    if (flush_topleft) {
+        geo->x = 0;
+        geo->y = 0;
+        geo->w = tree[root_id].ob_width;
+        geo->h = tree[root_id].ob_height;
+    } else {
+        form_center(tree, &geo->x, &geo->y, &geo->w, &geo->h);
+    }
     form_dial(FMD_START, geo->x, geo->y, geo->w, geo->h, geo->x, geo->y, geo->w, geo->h);
     objc_draw(tree, root_id, MAX_DEPTH, geo->x, geo->y, geo->w, geo->h);
 }
@@ -222,7 +249,7 @@ static void pw_dialog_show(void)
     pw_dlg[PW_LINE].ob_spec.free_string = (char *)msg;
 
     wire_tree(pw_dlg, PW_NOBJS);
-    dialog_open(pw_dlg, PW_ROOT, &pw_geo);
+    dialog_open(pw_dlg, PW_ROOT, &pw_geo, 0);
 }
 
 static void pw_dialog_hide(void)
@@ -493,11 +520,40 @@ static const int fp_sd_objs[]   = { FP_LBL_SDPATH, FP_SDPATH_EDIT };
 #define FP_TNFS_OBJS_COUNT ((int)(sizeof(fp_tnfs_objs) / sizeof(fp_tnfs_objs[0])))
 #define FP_SD_OBJS_COUNT   ((int)(sizeof(fp_sd_objs) / sizeof(fp_sd_objs[0])))
 
+/* On-screen (x,y,w,h) for each fp_tnfs_objs[]/fp_sd_objs[] entry, snapshot
+ * once by fp_dialog_init() right after it lays them out. The TNFS block
+ * and the SD block deliberately occupy the SAME reserved vertical span
+ * (see fp_dialog_init()'s own comment) so the dialog's height never
+ * changes when Source is toggled -- but that means the CURRENTLY HIDDEN
+ * block's editable objects (FP_HOST_EDIT/FP_MOUNT_EDIT/FP_SDPATH_EDIT)
+ * still sit at the exact same coordinates as the visible ones, HIDETREE
+ * or not. That overlap of two EDITABLE objects turned out to be real
+ * hardware fragile: clicking into a visible text field could hit-test
+ * against a HIDETREE'd-but-still-same-rectangle one instead and crash
+ * (reproduced on real hardware, three bombs). fp_apply_backend_visibility()
+ * below now also shrinks hidden objects to zero size (so they can never
+ * be hit-tested at any click coordinate) and restores this snapshot when
+ * showing them again, instead of relying on HIDETREE alone. */
+static short fp_tnfs_geom[FP_TNFS_OBJS_COUNT][4]; /* x, y, w, h */
+static short fp_sd_geom[FP_SD_OBJS_COUNT][4];
+
 #define FP_BUF_NICK   PROFILE_NICK_LEN   /* 24 */
 #define FP_BUF_HOST   PROFILE_HOST_LEN   /* 64 */
 #define FP_BUF_PORT   7
 #define FP_BUF_MOUNT  PROFILE_MOUNT_LEN  /* 32 */
-#define FP_BUF_SDPATH PROFILE_SDPATH_LEN /* 256 */
+/* NOT PROFILE_SDPATH_LEN (256) -- a 256-byte scrolling G_FBOXTEXT field
+ * reproducibly crashed real hardware (three bombs, every time) the moment
+ * it was clicked into, even after the HIDETREE-overlap fix above. 64
+ * matches SIDETNFS-Config's own sd_path editor field exactly
+ * (SideTNFS-Config/src/dialog.c TE_BUF_SDPATH) -- the only OTHER place in
+ * this whole codebase that edits an SD path, and the only size actually
+ * proven to work on real hardware. The firmware/wire sd_path field itself
+ * stays 256 bytes (profile.h, sidetnfs_floppy_config.h) -- only this UI
+ * editor's own buffer/TEDINFO is capped, so a folder path longer than 63
+ * characters (already generous for a filesystem path) is truncated on
+ * save via this editor. buf_copy()'s strncpy-based copy into the real
+ * 256-byte Profile.sd_path field is unaffected either way. */
+#define FP_BUF_SDPATH 64
 
 static char buf_fp_nick  [FP_BUF_NICK];
 static char buf_fp_host  [FP_BUF_HOST];
@@ -564,27 +620,35 @@ static void update_fp_source_buttons(void)
     }
 }
 
-/* Shows the TNFS fields and hides the SD field, or vice versa, via the
- * HIDETREE object flag -- both sets occupy the same reserved vertical
- * span (see fp_dialog_init()), so no resize/redraw of anything but these
- * objects is needed. Caller redraws FP_ROOT afterward. */
-static void fp_apply_backend_visibility(void)
+/* Shows one block's objects at their real, laid-out geometry (restored
+ * from fp_tnfs_geom/fp_sd_geom) with HIDETREE cleared; hides the other
+ * block by shrinking each of its objects to zero size AND setting
+ * HIDETREE -- see fp_tnfs_geom's own comment for why zero size, not just
+ * HIDETREE, is needed. Caller redraws FP_ROOT afterward. */
+static void fp_set_block_visible(const int *ids, short geom[][4], int count, int visible)
 {
     int i;
+    for (i = 0; i < count; i++) {
+        OBJECT *ob = &fp_dlg[ids[i]];
+        if (visible) {
+            ob->ob_x = geom[i][0];
+            ob->ob_y = geom[i][1];
+            ob->ob_width  = geom[i][2];
+            ob->ob_height = geom[i][3];
+            ob->ob_flags &= (unsigned short)(~HIDETREE);
+        } else {
+            ob->ob_x = ob->ob_y = ob->ob_width = ob->ob_height = 0;
+            ob->ob_flags |= (unsigned short)HIDETREE;
+        }
+    }
+}
+
+static void fp_apply_backend_visibility(void)
+{
     int show_tnfs = (fp_editor_backend != PROFILE_BACKEND_SD);
 
-    for (i = 0; i < FP_TNFS_OBJS_COUNT; i++) {
-        if (show_tnfs)
-            fp_dlg[fp_tnfs_objs[i]].ob_flags &= (unsigned short)(~HIDETREE);
-        else
-            fp_dlg[fp_tnfs_objs[i]].ob_flags |= (unsigned short)HIDETREE;
-    }
-    for (i = 0; i < FP_SD_OBJS_COUNT; i++) {
-        if (show_tnfs)
-            fp_dlg[fp_sd_objs[i]].ob_flags |= (unsigned short)HIDETREE;
-        else
-            fp_dlg[fp_sd_objs[i]].ob_flags &= (unsigned short)(~HIDETREE);
-    }
+    fp_set_block_visible(fp_tnfs_objs, fp_tnfs_geom, FP_TNFS_OBJS_COUNT, show_tnfs);
+    fp_set_block_visible(fp_sd_objs,   fp_sd_geom,   FP_SD_OBJS_COUNT,   !show_tnfs);
 }
 
 static void fp_dialog_init(int show_delete)
@@ -686,6 +750,25 @@ static void fp_dialog_init(int show_delete)
     fp_dlg[FP_CANCEL].ob_spec.free_string = " Cancel ";
 
     wire_tree(fp_dlg, FP_NOBJS);
+
+    /* Snapshot each toggle-affected object's real geometry now, before
+     * fp_apply_backend_visibility() ever zero-sizes the currently-hidden
+     * block -- see fp_tnfs_geom's own comment. */
+    {
+        int i;
+        for (i = 0; i < FP_TNFS_OBJS_COUNT; i++) {
+            fp_tnfs_geom[i][0] = fp_dlg[fp_tnfs_objs[i]].ob_x;
+            fp_tnfs_geom[i][1] = fp_dlg[fp_tnfs_objs[i]].ob_y;
+            fp_tnfs_geom[i][2] = fp_dlg[fp_tnfs_objs[i]].ob_width;
+            fp_tnfs_geom[i][3] = fp_dlg[fp_tnfs_objs[i]].ob_height;
+        }
+        for (i = 0; i < FP_SD_OBJS_COUNT; i++) {
+            fp_sd_geom[i][0] = fp_dlg[fp_sd_objs[i]].ob_x;
+            fp_sd_geom[i][1] = fp_dlg[fp_sd_objs[i]].ob_y;
+            fp_sd_geom[i][2] = fp_dlg[fp_sd_objs[i]].ob_width;
+            fp_sd_geom[i][3] = fp_dlg[fp_sd_objs[i]].ob_height;
+        }
+    }
 }
 
 static void fp_load_from_profile(const Profile *p, int is_new)
@@ -735,6 +818,7 @@ static int fp_editor_run(ProfileConfig *cfg, int index)
     DialogGeometry geo;
     short which;
     int done;
+    int first_form_do = 1;
     int is_new = profile_slot_is_empty(&cfg->profiles[index]);
     Profile working;
     char msg[200];
@@ -751,11 +835,27 @@ static int fp_editor_run(ProfileConfig *cfg, int index)
 
     fp_dialog_init(!is_new);
     fp_load_from_profile(&working, is_new);
-    dialog_open(fp_dlg, FP_ROOT, &geo);
+    dialog_open(fp_dlg, FP_ROOT, &geo, 0);
 
     done = 0;
     while (!done) {
-        which = dialog_click(fp_dlg, FP_NICK_EDIT);
+        /* FP_NICK_EDIT only as the edit object on the FIRST form_do() of
+         * this dialog session (auto-focuses Nickname the instant it
+         * opens) -- every SUBSEQUENT re-entry (after SOURCE_TNFS_BTN/
+         * SOURCE_SD_BTN/FP_ACTIVE_BTN, all EXIT objects that return here
+         * and loop back into another dialog_click()) uses FP_ROOT
+         * instead, same as every other dialog in this file (FE_ROOT/
+         * FS_ROOT). Repeatedly re-passing the SAME edit object across
+         * many form_do() calls on this dialog reproducibly crashed on
+         * real hardware (three bombs) as soon as the user then clicked
+         * into that field -- re-entering edit mode on an object that was
+         * already left in edit mode by a previous form_do() call is not
+         * a pattern any other dialog here relies on. Clicking the
+         * Nickname box by hand still enters edit mode normally either
+         * way -- this only gives up the "already focused" convenience on
+         * the very first frame after a button click. */
+        which = dialog_click(fp_dlg, first_form_do ? FP_NICK_EDIT : FP_ROOT);
+        first_form_do = 0;
 
         switch (which) {
         case FP_SOURCE_TNFS_BTN:
@@ -926,7 +1026,7 @@ static void edit_servers_run(ProfileConfig *cfg)
 
     fe_dialog_init();
     fe_refresh_rows(cfg);
-    dialog_open(fe_dlg, FE_ROOT, &geo);
+    dialog_open(fe_dlg, FE_ROOT, &geo, 0);
 
     done = 0;
     while (!done) {
@@ -1051,7 +1151,7 @@ static int server_selector_run(ProfileConfig *cfg)
 
     fs_dialog_init();
     fs_refresh_rows(cfg);
-    dialog_open(fs_dlg, FS_ROOT, &geo);
+    dialog_open(fs_dlg, FS_ROOT, &geo, 0);
 
     for (;;) {
         which = dialog_click(fs_dlg, FS_ROOT);
@@ -1076,40 +1176,43 @@ static int server_selector_run(ProfileConfig *cfg)
     return result;
 }
 
+/* 16, not the LFN browser's own 25-per-page figure (RESEARCH-STEP0.md) --
+ * 25 rows plus the title/source/directory lines and buttons made the main
+ * window taller than a real 640x200 medium-resolution screen (~223px
+ * needed vs. 200px available); 20 rows (~188px) still fit but left little
+ * margin. 16 rows gives comfortable headroom on medium resolution. If a
+ * real 25-entry page is needed later, this will need either a scrollable
+ * list or a resolution-dependent row count, not just raising this
+ * constant back up. Defined here (not down in the FM_* section below, its
+ * logical home) because the real browse-entry state right below already
+ * needs it. */
+#define FM_MAX_VISIBLE_FILES 15
+
 /* ================================================================== */
-/* Mock file/directory browser data                                    */
+/* Real directory browser state (Step 2)                               */
 /*                                                                       */
-/* STEP 1.x PLACEHOLDER -- there is no real LFN directory browser yet    */
-/* (that is Step 2, see RESEARCH-STEP0.md sections 5/6/9). Everything in */
-/* this block, plus fm_refresh_files() and cd_refresh_rows() below (the  */
-/* only two functions that read it), exists purely so the main window's */
-/* and Change Dir dialog's selection/double-click/navigation UI can be   */
-/* built and tested now. Replacing this with real TNFS/SD directory      */
-/* results later should only ever require changing this block and the   */
-/* two loader functions -- nothing in the event-loop/selection code      */
-/* below should need to change.                                          */
+/* One active browse session (fp_gen/fp_browse_ok below), mirroring the  */
+/* single-session contract sidetnfs_floppy_browse.h already documents on */
+/* the firmware side -- FLOPPY.PRG is one Atari-side client, so there is */
+/* never more than one open profile/CWD to track here either. No         */
+/* pagination UI yet (Step 3): every list below is always page 0 of the  */
+/* active CWD, capped at FM_MAX_VISIBLE_FILES entries. Directories and   */
+/* files come back from the firmware as two SEPARATE pages (never mixed  */
+/* in one page, see GEMDRVEMUL_FLOPPY_PAGE) -- fm_load_entries() below   */
+/* combines them for display: directories first, then files, both drawn */
+/* from the very start of their own respective page-0 listing. */
 /* ================================================================== */
+static unsigned long fm_gen;     /* current browse generation; 0 = no active session */
+static int fm_browse_ok;         /* 1 once BROWSE_OPEN has succeeded for fm_gen */
+static int fm_browse_profile_index = -1; /* which cfg->profiles[] slot fm_gen belongs to, -1 = none */
+static char fm_cwd[FLOPPY_BROWSE_CWD_LEN]; /* current real CWD, full 256 bytes (fm_title_text is a truncated display copy) */
+
 typedef struct {
-    const char *name;
-    unsigned long size_kb;
-} MockFileEntry;
-
-static const MockFileEntry MOCK_FILES[] = {
-    { "ANOTHER_WORLD.ST",   800 },
-    { "DUNGEON_MASTER.ST",  720 },
-    { "LEMMINGS_DISK_1.ST", 800 },
-    { "LEMMINGS_DISK_2.ST", 800 },
-    { "LOTUS_TURBO.ST",     720 },
-    { "SPEEDBALL_II.ST",    800 },
-};
-#define MOCK_FILE_COUNT ((int)(sizeof(MOCK_FILES) / sizeof(MOCK_FILES[0])))
-
-/* Same mock subdirectory list is shown regardless of which directory the
- * Change Dir dialog is actually in -- acceptable for a placeholder whose
- * only job is exercising the navigate-up/navigate-down UI and the
- * configured-root boundary check, not modeling a real directory tree. */
-static const char *MOCK_SUBDIRS[] = { "ARCADE", "DEMOS", "GAMES", "UTILITIES" };
-#define MOCK_SUBDIR_COUNT ((int)(sizeof(MOCK_SUBDIRS) / sizeof(MOCK_SUBDIRS[0])))
+    char name[FLOPPY_BROWSE_NAME_LEN]; /* full name, NOT truncated -- CHANGE_DIR needs the exact name */
+    int is_dir;
+} FmEntry;
+static FmEntry fm_entries[FM_MAX_VISIBLE_FILES];
+static int fm_entry_count;
 
 /* ================================================================== */
 /* Profile source/path helpers                                         */
@@ -1121,7 +1224,7 @@ static const char *profile_backend_word(const Profile *p)
 }
 
 /* The profile's own configured root -- mount_path for TNFS, sd_path for
- * SD. The Change Dir dialog never lets the user navigate above this. */
+ * SD. FM_DIRUP_BTN's handler never lets the user navigate above this. */
 static void profile_root_dir(const Profile *p, char *out, int outsize)
 {
     const char *root = (p->backend == PROFILE_BACKEND_SD) ? p->sd_path : p->mount_path;
@@ -1129,276 +1232,148 @@ static void profile_root_dir(const Profile *p, char *out, int outsize)
     out[outsize - 1] = '\0';
 }
 
-/* The directory currently shown in the main window: last_directory if the
- * profile has one, otherwise the configured root. */
-static void profile_current_dir(const Profile *p, char *out, int outsize)
+/* Opens (or re-uses) the real browse session for cfg->active_index --
+ * BROWSE_OPEN is only actually sent when switching to a DIFFERENT profile
+ * than the one fm_gen already belongs to, so a routine refresh never
+ * silently resets navigation the user already did via CHANGE_DIR back to
+ * last_directory. On success, updates fm_gen/fm_cwd and persists the
+ * resulting CWD into the profile's own last_directory (RAM only -- an
+ * explicit Save is still required to reach flash, same policy as before).
+ * Returns 1 on success, 0 on failure (already alerted via form_alert). */
+static int fm_open_browse_for_active_profile(ProfileConfig *cfg)
 {
-    if (buf_nonempty(p->last_directory))
-        strncpy(out, p->last_directory, outsize - 1);
-    else
-        profile_root_dir(p, out, outsize);
-    out[outsize - 1] = '\0';
-}
+    FloppyBrowseResult r;
+    int rc;
 
-/* Appends "/name" to path, bounded to pathsize. */
-static void cd_path_push(char *path, int pathsize, const char *name)
-{
-    int len = (int)strlen(path);
-    if (len > 0 && path[len - 1] != '/' && len < pathsize - 1) {
-        path[len] = '/';
-        path[len + 1] = '\0';
-        len++;
+    if (fm_browse_ok && fm_browse_profile_index == cfg->active_index)
+        return 1;
+
+    rc = floppy_probe_browse_open((unsigned long)cfg->active_index, &r);
+    if (rc != FLOPPY_PROBE_OK) {
+        fm_browse_ok = 0;
+        form_alert(1, "[3][Could not reach the|cartridge (timeout).][OK]");
+        return 0;
     }
-    strncat(path, name, (size_t)(pathsize - 1 - len));
-}
-
-/* Removes the last "/component" from path, never shortening it past
- * root_dir -- the configured-root navigation boundary. */
-static void cd_path_pop(char *path, const char *root_dir)
-{
-    int len;
-    if (strcmp(path, root_dir) == 0)
-        return; /* already at root -- caller should not have offered ".." */
-
-    len = (int)strlen(path);
-    while (len > 0 && path[len - 1] == '/')
-        path[--len] = '\0';
-    while (len > 0 && path[len - 1] != '/')
-        path[--len] = '\0';
-    while (len > 1 && path[len - 1] == '/')
-        path[--len] = '\0';
-
-    if ((int)strlen(path) < (int)strlen(root_dir) || strncmp(path, root_dir, strlen(root_dir)) != 0)
-        strncpy(path, root_dir, PROFILE_LASTDIR_LEN - 1); /* safety clamp */
-}
-
-/* Generic double-click-aware click loop, shared by the main window's file
- * list and the Change Dir dialog's directory list -- both need to detect
- * a double-click on a row (form_do() alone never reports click count) and
- * both use the same RBUTTON-family single-selection idiom for their rows.
- * Honors EXIT-flagged buttons the normal way (returns their id,
- * *out_double left 0); reports a click on any object in
- * [row_base, row_base+row_count) via the return value with *out_double
- * set from the AES click count, WITHOUT exiting the loop -- the caller
- * decides what a single vs. double click on a row means. */
-static short list_dialog_click(OBJECT *tree, int root_id, int row_base, int row_count, int *out_double)
-{
-    short mx, my, mb, ks, kr, br;
-    short msg[8];
-    short event, obj, next;
-
-    for (;;) {
-        event = evnt_multi(MU_BUTTON,
-                           2, 1, 1,
-                           0, 0, 0, 0, 0,
-                           0, 0, 0, 0, 0,
-                           msg,
-                           0UL,
-                           &mx, &my, &mb, &ks, &kr, &br);
-        if (!(event & MU_BUTTON))
-            continue;
-
-        obj = objc_find(tree, root_id, MAX_DEPTH, mx, my);
-        if (obj <= 0)
-            continue;
-        if (tree[obj].ob_state & DISABLED)
-            continue; /* DISABLED rows (e.g. ".." at the configured root) are inert */
-
-        next = obj;
-        if (!form_button(tree, obj, br, &next)) {
-            short result = (short)(next & 0x7FFF);
-            if (result > 0)
-                tree[result].ob_state &= (unsigned short)(~SELECTED);
-            *out_double = 0;
-            return result;
-        }
-        if (obj >= row_base && obj < row_base + row_count) {
-            *out_double = (br >= 2);
-            return (short)obj;
-        }
-    }
-}
-
-/* ================================================================== */
-/* Change Dir dialog (CD_*)                                            */
-/* One directory level at a time: ".." (hidden when already at the       */
-/* profile's configured root) plus the mock subdirectory list. Single    */
-/* click selects a row; double-click or [Open] applies the selected row  */
-/* and closes; [Cancel] closes without changing anything. This is new UI */
-/* plumbing -- no dialog in the reused SIDETNFS-Config source material   */
-/* does a directory-only picker like this.                               */
-/* ================================================================== */
-#define CD_MAX_ROWS (1 + MOCK_SUBDIR_COUNT) /* ".." + mock subdirs */
-enum {
-    CD_ROOT = 0,
-    CD_TITLE,
-    CD_DIV1,
-    CD_ROW_BASE
-};
-#define CD_ROW(i)      (CD_ROW_BASE + (i))
-#define CD_AFTER_ROWS  (CD_ROW_BASE + CD_MAX_ROWS)
-#define CD_DIV2   (CD_AFTER_ROWS + 0)
-#define CD_OPEN   (CD_AFTER_ROWS + 1)
-#define CD_CANCEL (CD_AFTER_ROWS + 2)
-#define CD_NOBJS  (CD_AFTER_ROWS + 3)
-static OBJECT cd_dlg[CD_NOBJS];
-
-#define CD_ROW_BUF 32
-static char cd_row_text[CD_MAX_ROWS][CD_ROW_BUF];
-static int cd_selected_row; /* -1 = none; index into cd_row_text/CD_ROW() */
-
-static void cd_dialog_init(void)
-{
-    LayoutMetrics lm;
-    int DW, DH;
-    int yt, ydiv1, yrow0, ydiv2, ybtn;
-    int i;
-
-    layout_metrics_get(&lm);
-
-    DW = 30 * lm.cw;
-    yt    = lm.tm;
-    ydiv1 = yt + lm.rh + 1;
-    yrow0 = ydiv1 + 5;
-    ydiv2 = yrow0 + CD_MAX_ROWS * lm.pitch + 2;
-    ybtn  = ydiv2 + 7;
-    DH    = ybtn + lm.rh + lm.tm + 3;
-
-    set_obj(cd_dlg, CD_ROOT, G_BOX, NONE, NORMAL, 0, 0, DW, DH);
-    cd_dlg[CD_ROOT].ob_spec.index = 0x00031070L;
-
-    set_obj(cd_dlg, CD_TITLE, G_STRING, NONE, NORMAL, 8*lm.cw, yt, 14*lm.cw, lm.rh);
-    cd_dlg[CD_TITLE].ob_spec.free_string = "Change Directory";
-
-    set_obj(cd_dlg, CD_DIV1, G_BOX, NONE, NORMAL, lm.cw, ydiv1, DW - 2*lm.cw, 2);
-    cd_dlg[CD_DIV1].ob_spec.index = 0x00001171L;
-
-    for (i = 0; i < CD_MAX_ROWS; i++) {
-        int ry = yrow0 + i * lm.pitch;
-        set_obj(cd_dlg, CD_ROW(i), G_STRING, SELECTABLE | RBUTTON, NORMAL, lm.cw, ry, 28*lm.cw, lm.rh);
-        cd_dlg[CD_ROW(i)].ob_spec.free_string = cd_row_text[i];
+    if (r.status != FLOPPY_BROWSE_OK) {
+        char msg[96];
+        fm_browse_ok = 0;
+        sprintf(msg, "[3][Could not open this source|(error %lu).][OK]", r.status);
+        form_alert(1, msg);
+        return 0;
     }
 
-    set_obj(cd_dlg, CD_DIV2, G_BOX, NONE, NORMAL, lm.cw, ydiv2, DW - 2*lm.cw, 2);
-    cd_dlg[CD_DIV2].ob_spec.index = 0x00001171L;
-
-    set_obj(cd_dlg, CD_OPEN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 2*lm.cw, ybtn, 9*lm.cw, lm.rh);
-    cd_dlg[CD_OPEN].ob_spec.free_string = "  Open  ";
-
-    set_obj(cd_dlg, CD_CANCEL, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 18*lm.cw, ybtn, 9*lm.cw, lm.rh);
-    cd_dlg[CD_CANCEL].ob_spec.free_string = " Cancel ";
-
-    wire_tree(cd_dlg, CD_NOBJS);
+    fm_gen = r.generation;
+    fm_browse_profile_index = cfg->active_index;
+    fm_browse_ok = 1;
+    strncpy(fm_cwd, r.cwd, sizeof(fm_cwd) - 1);
+    fm_cwd[sizeof(fm_cwd) - 1] = '\0';
+    strncpy(cfg->profiles[cfg->active_index].last_directory, fm_cwd, PROFILE_LASTDIR_LEN - 1);
+    cfg->profiles[cfg->active_index].last_directory[PROFILE_LASTDIR_LEN - 1] = '\0';
+    return 1;
 }
 
-/* Rebuilds the row list for the directory the dialog is about to show --
- * called once when the dialog opens (see this file's header comment on
- * "bij openen" for why this is a per-dialog-open rebuild, not a
- * per-navigation one: this dialog is a single-level picker, not a
- * multi-level drill-down browser). ".." stays visible but DISABLED when
- * current_dir already equals the profile's configured root -- same
- * "greyed out, not clickable, but no layout gap" convention
- * SIDETNFS-Config's TE_DELETE uses for "not applicable to this slot"
- * (RESEARCH-STEP0.md section 3.8) -- HIDETREE would leave every row below
- * it sitting one slot too high with a blank gap at the top, since rows
- * are never repositioned after being laid out. */
-static void cd_refresh_rows(const char *current_dir, const char *root_dir)
+/* Fills fm_entries[]/fm_entry_count from page 0 of the active CWD's
+ * directory listing (first, up to FM_MAX_VISIBLE_FILES) then, if room is
+ * left, page 0 of the file listing -- no pagination yet (Step 3), so a
+ * directory with more entries than fit just shows its first
+ * FM_MAX_VISIBLE_FILES dirs-then-files and nothing beyond that. A
+ * FLOPPY_PROBE_OK communication result with a non-OK/non-END_OF_DIRECTORY
+ * browse status is alerted once; count is always trustworthy as 0 in
+ * every error case (sidetnfs_floppy_browse_get_page()'s own contract), so
+ * the list is simply left empty rather than guessed at. */
+static void fm_load_entries(void)
 {
-    int i;
-    int at_root = (strcmp(current_dir, root_dir) == 0);
+    FloppyPageResult dp, fp;
+    int i, n;
 
-    strncpy(cd_row_text[0], "..", CD_ROW_BUF - 1);
-    cd_row_text[0][CD_ROW_BUF - 1] = '\0';
-    if (at_root)
-        cd_dlg[CD_ROW(0)].ob_state |= (unsigned short)DISABLED;
-    else
-        cd_dlg[CD_ROW(0)].ob_state &= (unsigned short)(~DISABLED);
-    cd_dlg[CD_ROW(0)].ob_state &= (unsigned short)(~SELECTED);
+    fm_entry_count = 0;
+    if (!fm_browse_ok)
+        return;
 
-    for (i = 0; i < MOCK_SUBDIR_COUNT; i++) {
-        sprintf(cd_row_text[i + 1], "%-.28s", MOCK_SUBDIRS[i]);
-        cd_dlg[CD_ROW(i + 1)].ob_state &= (unsigned short)(~(SELECTED | DISABLED));
+    if (floppy_probe_browse_get_dir_page(fm_gen, 0UL, &dp) != FLOPPY_PROBE_OK) {
+        form_alert(1, "[3][Could not reach the|cartridge (timeout).][OK]");
+        return;
+    }
+    if (dp.status != FLOPPY_BROWSE_OK && dp.status != FLOPPY_BROWSE_STATUS_END_OF_DIRECTORY) {
+        char msg[96];
+        sprintf(msg, "[3][Could not list directories|(error %lu).][OK]", dp.status);
+        form_alert(1, msg);
+        return;
+    }
+    n = (int)dp.count;
+    if (n > FM_MAX_VISIBLE_FILES) n = FM_MAX_VISIBLE_FILES;
+    for (i = 0; i < n; i++) {
+        strncpy(fm_entries[fm_entry_count].name, dp.entries[i], FLOPPY_BROWSE_NAME_LEN - 1);
+        fm_entries[fm_entry_count].name[FLOPPY_BROWSE_NAME_LEN - 1] = '\0';
+        fm_entries[fm_entry_count].is_dir = 1;
+        fm_entry_count++;
     }
 
-    cd_selected_row = -1;
+    if (fm_entry_count >= FM_MAX_VISIBLE_FILES)
+        return;
+
+    if (floppy_probe_browse_get_file_page(fm_gen, 0UL, &fp) != FLOPPY_PROBE_OK) {
+        form_alert(1, "[3][Could not reach the|cartridge (timeout).][OK]");
+        return;
+    }
+    if (fp.status != FLOPPY_BROWSE_OK && fp.status != FLOPPY_BROWSE_STATUS_END_OF_DIRECTORY) {
+        char msg[96];
+        sprintf(msg, "[3][Could not list files|(error %lu).][OK]", fp.status);
+        form_alert(1, msg);
+        return;
+    }
+    n = (int)fp.count;
+    for (i = 0; i < n && fm_entry_count < FM_MAX_VISIBLE_FILES; i++) {
+        strncpy(fm_entries[fm_entry_count].name, fp.entries[i], FLOPPY_BROWSE_NAME_LEN - 1);
+        fm_entries[fm_entry_count].name[FLOPPY_BROWSE_NAME_LEN - 1] = '\0';
+        fm_entries[fm_entry_count].is_dir = 0;
+        fm_entry_count++;
+    }
 }
 
-/* Runs the Change Dir dialog against *current_dir (in/out, a
- * PROFILE_LASTDIR_LEN buffer) bounded by root_dir. Returns 1 if the
- * directory changed (caller should persist it to the active profile's
- * last_directory and refresh the file list), 0 if cancelled. */
-static int cd_run(char *current_dir, const char *root_dir)
+/* Navigates the active browse session: go_up=1 for ".." (name ignored),
+ * else descends into `name` (must be one of the CURRENT CWD's own
+ * directory-page entries). Updates fm_gen/fm_cwd and persists the
+ * resulting CWD into the active profile's last_directory (RAM only) on
+ * success. Returns 1 on success, 0 on failure (already alerted) -- on
+ * failure fm_gen/fm_cwd are left exactly as they were, matching
+ * FLOPPY_BROWSE_CHANGE_DIR's own "a failed change never moves the CWD"
+ * contract. Caller is responsible for calling fm_load_entries() again
+ * afterward. */
+static int fm_change_dir(ProfileConfig *cfg, int go_up, const char *name)
 {
-    DialogGeometry geo;
-    short which;
-    int is_double;
-    int done;
-    int changed = 0;
+    FloppyBrowseResult r;
+    int rc;
 
-    cd_dialog_init();
-    cd_refresh_rows(current_dir, root_dir);
-    dialog_open(cd_dlg, CD_ROOT, &geo);
-
-    done = 0;
-    while (!done) {
-        which = list_dialog_click(cd_dlg, CD_ROOT, CD_ROW_BASE, CD_MAX_ROWS, &is_double);
-
-        if (which >= CD_ROW_BASE && which < CD_AFTER_ROWS) {
-            cd_selected_row = which - CD_ROW_BASE;
-            if (is_double)
-                which = CD_OPEN; /* fall through to the Open handling below */
-            else
-                continue;
-        }
-
-        switch (which) {
-        case CD_OPEN:
-            if (cd_selected_row < 0)
-                break; /* nothing selected -- Open does nothing, matches Start's own rule */
-            /* Row 0 is always the ".." slot and row 1..MOCK_SUBDIR_COUNT
-             * are always the subdirs, regardless of at_root -- row 0 is
-             * merely DISABLED (never clickable, see cd_refresh_rows())
-             * when already at root, not removed from the layout, so this
-             * mapping never shifts. */
-            if (cd_selected_row == 0) {
-                cd_path_pop(current_dir, root_dir);
-            } else {
-                int subdir_index = cd_selected_row - 1;
-                if (subdir_index >= 0 && subdir_index < MOCK_SUBDIR_COUNT)
-                    cd_path_push(current_dir, PROFILE_LASTDIR_LEN, MOCK_SUBDIRS[subdir_index]);
-            }
-            changed = 1;
-            done = 1;
-            break;
-
-        case CD_CANCEL:
-        default:
-            done = 1;
-            break;
-        }
+    rc = floppy_probe_browse_change_dir(fm_gen, go_up, name ? name : "", &r);
+    if (rc != FLOPPY_PROBE_OK) {
+        form_alert(1, "[3][Could not reach the|cartridge (timeout).][OK]");
+        return 0;
+    }
+    if (r.status != FLOPPY_BROWSE_OK) {
+        char msg[96];
+        sprintf(msg, "[3][Could not change directory|(error %lu).][OK]", r.status);
+        form_alert(1, msg);
+        return 0;
     }
 
-    dialog_close(&geo);
-    return changed;
+    fm_gen = r.generation;
+    strncpy(fm_cwd, r.cwd, sizeof(fm_cwd) - 1);
+    fm_cwd[sizeof(fm_cwd) - 1] = '\0';
+    strncpy(cfg->profiles[cfg->active_index].last_directory, fm_cwd, PROFILE_LASTDIR_LEN - 1);
+    cfg->profiles[cfg->active_index].last_directory[PROFILE_LASTDIR_LEN - 1] = '\0';
+    return 1;
 }
 
 /* ================================================================== */
 /* Main window (FM_*)                                                  */
 /* The central hub: shown immediately at startup (see dialog_run()) and  */
-/* returned to after every Source/Change Dir/Start action -- never an    */
-/* intermediate "pick a source first" gate. Source and Change Dir open   */
-/* the already-existing selector/editor dialogs directly; there is no    */
-/* separate chooser dialog of its own anymore.                           */
+/* returned to after every Source/Dir Up/Start action -- never an        */
+/* intermediate "pick a source first" gate. Source opens the already-    */
+/* existing selector/editor dialog directly; directories are navigated   */
+/* inline in the row list itself (double-click to descend, Dir Up to go  */
+/* up a level) -- there is no separate directory-picker dialog anymore.  */
 /* ================================================================== */
-/* 16, not the LFN browser's own 25-per-page figure (RESEARCH-STEP0.md) --
- * 25 rows plus the title/source/directory lines and buttons made this
- * dialog taller than a real 640x200 medium-resolution screen (~223px
- * needed vs. 200px available); 20 rows (~188px) still fit but left little
- * margin. 16 rows gives comfortable headroom on medium resolution. If a
- * real 25-entry page is needed later, this will need either a scrollable
- * list or a resolution-dependent row count, not just raising this
- * constant back up. */
-#define FM_MAX_VISIBLE_FILES 16
 enum {
     FM_ROOT = 0,
     FM_TITLE,
@@ -1415,10 +1390,16 @@ enum {
 #define FM_AFTER_ROWS  (FM_ROW_BASE + FM_MAX_VISIBLE_FILES)
 #define FM_DIV3          (FM_AFTER_ROWS + 0)
 #define FM_SOURCE_BTN    (FM_AFTER_ROWS + 1)
-#define FM_CHANGEDIR_BTN (FM_AFTER_ROWS + 2)
+#define FM_DIRUP_BTN     (FM_AFTER_ROWS + 2)
 #define FM_START_BTN     (FM_AFTER_ROWS + 3)
 #define FM_QUIT_BTN      (FM_AFTER_ROWS + 4)
-#define FM_NOBJS         (FM_AFTER_ROWS + 5)
+/* Placeholder for future pagination (Step 3+) -- buttons only for now, no
+ * paging logic wired in yet: GET_DIR_PAGE/GET_FILE_PAGE already support
+ * an arbitrary page_index on the protocol/firmware side, but fm_load_entries()
+ * only ever asks for page 0. Clicking either does nothing yet. */
+#define FM_PREV_BTN      (FM_AFTER_ROWS + 5)
+#define FM_NEXT_BTN      (FM_AFTER_ROWS + 6)
+#define FM_NOBJS         (FM_AFTER_ROWS + 7)
 static OBJECT fm_dlg[FM_NOBJS];
 
 /* 78 characters wide -- the Atari ST's own medium/high resolution text
@@ -1439,108 +1420,197 @@ static char fm_row_text[FM_MAX_VISIBLE_FILES][FM_ROW_BUF];
 #define FM_SOURCE_BTN_BUF 16
 static char fm_source_btn_text[FM_SOURCE_BTN_BUF]; /* "Source: TNFS" / "Source: SD" -- own text doubles as the value, same idiom as Active/Source toggles elsewhere */
 static int fm_selected_row = -1; /* -1 = no file selected */
+static int fm_short_screen; /* set by fm_dialog_init(), read by dialog_run() to open flush top-left instead of centered -- see dialog_open()'s own comment */
 
 static void fm_dialog_init(void)
 {
     LayoutMetrics lm;
-    int DW, DH;
+    int DW, DH, xl;
     int yt, ydiv1, ysource, ydiv2, yrow0, ydiv3, ybtn;
     int i;
 
     layout_metrics_get(&lm);
+    fm_short_screen = lm.short_screen;
 
-    DW = FM_DIALOG_CHARS * lm.cw;
-    yt      = lm.tm;
+    /* DW is the REAL measured screen width (lm.sw) on a medium-res-height
+     * screen, not FM_DIALOG_CHARS*lm.cw -- that char-count estimate
+     * assumed an 8px system font, which real hardware/Hatari testing
+     * showed does not always hold (a visible gap of unused screen on the
+     * right, confirmed by screenshot, not just a rounding sliver). xl is
+     * the matching left/right inset -- 1px flush on a short screen (the
+     * "no kaderrand" fullscreen look that was asked for), lm.cw otherwise
+     * (unchanged from before). Every full-width object below (root,
+     * dividers, title, source line, rows) uses DW/xl consistently so
+     * nothing is ever narrower than the real screen on a short screen.
+     * The two RIGHT-anchored buttons (Prev/Next, near the end of this
+     * function) are positioned from DW-xl backward for the same reason:
+     * their own on-screen position must never depend on a possibly-wrong
+     * cw-based guess either. */
+    DW = lm.short_screen ? lm.sw : (FM_DIALOG_CHARS * lm.cw);
+    xl = lm.short_screen ? 1 : lm.cw;
+    /* Top margin is also trimmed to a bare 1px on a medium-res-height
+     * screen -- same "every pixel counts, we're right at the edge"
+     * reasoning as the divider removal below, now paired with opening the
+     * dialog flush against the screen's top-left corner instead of
+     * centered (see dialog_open()'s own comment) so this margin is never
+     * wasted doubled-up above AND below the visible content. */
+    yt = lm.short_screen ? 1 : lm.tm;
+    /* FM_DIV1 (title/source separator) and FM_DIV3 (rows/buttons
+     * separator) are HIDETREE'd -- never left un-set_obj()'d, see below --
+     * on a medium-res-height screen only: still too tall at 15 rows with
+     * both lines in place. Each divider line itself is only 2px, but the
+     * surrounding gaps it justified (5px above the row list, 7px below)
+     * are what actually cost the space; collapsing straight to a tight
+     * 2px gap in their place (still no visual overlap, just no line
+     * drawn) is what actually buys back the few pixels needed. FM_DIV2
+     * (source/row-list separator) stays either way -- removing it too
+     * wasn't asked for and the rows/buttons gap alone already gets this
+     * to fit. ydiv1/ydiv3 are still always computed (matching the
+     * non-short layout) even when unused for the OTHER y-coordinates
+     * below, purely so FM_DIV1/FM_DIV3 always get a valid set_obj() call
+     * -- an object that's only ever HIDETREE'd and never otherwise
+     * initialized is exactly the kind of half-set-up object that has
+     * already crashed real hardware once this project (see the SD-folder
+     * field / HIDETREE-overlap fixes) and must not happen again. */
     ydiv1   = yt + lm.rh + 1;
-    ysource = ydiv1 + 5;
-    ydiv2   = ysource + lm.rh + 2;
-    yrow0   = ydiv2 + 5;
-    ydiv3   = yrow0 + FM_MAX_VISIBLE_FILES * lm.pitch + 2;
-    ybtn    = ydiv3 + 7;
-    DH      = ybtn + lm.rh + lm.tm + 3;
+    ydiv3   = yt + lm.rh + 1; /* placeholder, overwritten below once yrow0 is known */
+    if (lm.short_screen) {
+        /* Measured precisely against lm.sh (the real screen work-area
+         * height) via pixel-level inspection of real renders. The margin
+         * this layout ends up with (a couple of pixels below the button
+         * row, since setting DH to lm.sh exactly was tried and made
+         * things worse for reasons not yet understood) is deliberately
+         * spent as real breathing room between FM_DIV2 and the first row
+         * (yrow0) instead of being wasted below the buttons -- the first
+         * filename sitting flush against the divider line looked wrong,
+         * and a sliver of desktop below the buttons is the lesser evil of
+         * the two once some margin has to exist somewhere. */
+        ysource = yt + lm.rh + 1;
+        ydiv2   = ysource + lm.rh + 1;
+        yrow0   = ydiv2 + 2 + 3; /* +2 for the divider line's own height, +3 real gap below it */
+        ybtn    = yrow0 + FM_MAX_VISIBLE_FILES * lm.pitch + 2; /* +2 pushes the row down to where DH (below) lands exactly on lm.sh -- pixel inspection of the previous build (ybtn with no +2) showed a 2px sliver of desktop still visible below the buttons */
+    } else {
+        ysource = ydiv1 + 5;
+        ydiv2   = ysource + lm.rh + 2;
+        yrow0   = ydiv2 + 5;
+        ybtn    = yrow0 + FM_MAX_VISIBLE_FILES * lm.pitch + 2 + 7;
+    }
+    ydiv3 = yrow0 + FM_MAX_VISIBLE_FILES * lm.pitch + 2; /* real value, valid in both branches */
+    /* +1 below the button row is NOT optional padding -- pixel-level
+     * inspection of a real render (Hatari screenshot) showed a G_BUTTON's
+     * own bottom border is drawn one row past ob_y+ob_height, so trimming
+     * this to exactly ybtn+rh (no slack at all) silently clipped every
+     * button's bottom border across the whole row. Using lm.sh directly
+     * here instead (to close the small gap below the buttons entirely)
+     * was tried and made things WORSE on a real render -- more of the
+     * desktop showed through, not less -- so this stays a computed sum,
+     * not the raw measured screen height; the small gap below the button
+     * row is the known-working state. */
+    DH = lm.short_screen ? (ybtn + lm.rh + 1) : (ybtn + lm.rh + lm.tm + 3);
 
     set_obj(fm_dlg, FM_ROOT, G_BOX, NONE, NORMAL, 0, 0, DW, DH);
-    fm_dlg[FM_ROOT].ob_spec.index = 0x00031070L;
+    /* 0x00031070L (every other dialog in this file) decodes, per this
+     * toolchain's own BFOBSPEC bitfield layout (mt_gem.h: character:8,
+     * framesize:8 SIGNED, framecol:4, textcol:4, textmode:1,
+     * fillpattern:3, interiorcol:4, packed MSB-first), to framesize=3
+     * (a 3px border), framecol=1 (black), fillpattern=7, interiorcol=0
+     * (white) -- that visible black frame is exactly the "kaderrand" that
+     * was asked to go away for a true fullscreen presentation. On a
+     * medium-res-height screen only, framesize is cleared to 0
+     * (0x00031070 with bits 16-23 zeroed = 0x00001070), keeping the same
+     * white fill/pattern but drawing no border at all -- same technique
+     * FM_DIV1/2/3's own 0x00001171L (framesize=0, interiorcol=1) already
+     * relies on for a borderless solid bar, just with framecol/interiorcol
+     * left as-is here since only the border needed to disappear, not the
+     * fill. */
+    fm_dlg[FM_ROOT].ob_spec.index = lm.short_screen ? 0x00001070L : 0x00031070L;
 
     /* The dialog title is the current directory (see fm_refresh()), not a
      * static "FLOPPY.PRG" -- the desktop's own menu bar already names the
      * running application across the top of the screen, so repeating it
      * here was pure duplication. */
-    set_obj(fm_dlg, FM_TITLE, G_STRING, NONE, NORMAL, lm.cw, yt, FM_CONTENT_CHARS*lm.cw, lm.rh);
+    set_obj(fm_dlg, FM_TITLE, G_STRING, NONE, NORMAL, xl, yt, DW - 2*xl, lm.rh);
     fm_dlg[FM_TITLE].ob_spec.free_string = fm_title_text;
 
-    set_obj(fm_dlg, FM_DIV1, G_BOX, NONE, NORMAL, lm.cw, ydiv1, DW - 2*lm.cw, 2);
+    set_obj(fm_dlg, FM_DIV1, G_BOX, NONE, NORMAL, xl, ydiv1, DW - 2*xl, 2);
     fm_dlg[FM_DIV1].ob_spec.index = 0x00001171L;
+    if (lm.short_screen)
+        fm_dlg[FM_DIV1].ob_flags |= (unsigned short)HIDETREE;
 
-    set_obj(fm_dlg, FM_SOURCE_LINE, G_STRING, NONE, NORMAL, lm.cw, ysource, FM_CONTENT_CHARS*lm.cw, lm.rh);
+    set_obj(fm_dlg, FM_SOURCE_LINE, G_STRING, NONE, NORMAL, xl, ysource, DW - 2*xl, lm.rh);
     fm_dlg[FM_SOURCE_LINE].ob_spec.free_string = fm_source_line;
 
-    set_obj(fm_dlg, FM_DIV2, G_BOX, NONE, NORMAL, lm.cw, ydiv2, DW - 2*lm.cw, 2);
+    set_obj(fm_dlg, FM_DIV2, G_BOX, NONE, NORMAL, xl, ydiv2, DW - 2*xl, 2);
     fm_dlg[FM_DIV2].ob_spec.index = 0x00001171L;
 
     for (i = 0; i < FM_MAX_VISIBLE_FILES; i++) {
         int ry = yrow0 + i * lm.pitch;
-        set_obj(fm_dlg, FM_ROW(i), G_STRING, SELECTABLE | RBUTTON, NORMAL, lm.cw, ry, FM_CONTENT_CHARS*lm.cw, lm.rh);
+        set_obj(fm_dlg, FM_ROW(i), G_STRING, SELECTABLE | RBUTTON, NORMAL, xl, ry, DW - 2*xl, lm.rh);
         fm_dlg[FM_ROW(i)].ob_spec.free_string = fm_row_text[i];
     }
 
-    set_obj(fm_dlg, FM_DIV3, G_BOX, NONE, NORMAL, lm.cw, ydiv3, DW - 2*lm.cw, 2);
+    set_obj(fm_dlg, FM_DIV3, G_BOX, NONE, NORMAL, xl, ydiv3, DW - 2*xl, 2);
     fm_dlg[FM_DIV3].ob_spec.index = 0x00001171L;
+    if (lm.short_screen)
+        fm_dlg[FM_DIV3].ob_flags |= (unsigned short)HIDETREE;
 
-    set_obj(fm_dlg, FM_SOURCE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 2*lm.cw, ybtn, 13*lm.cw, lm.rh);
+    set_obj(fm_dlg, FM_SOURCE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 1*lm.cw, ybtn, 13*lm.cw, lm.rh);
     fm_dlg[FM_SOURCE_BTN].ob_spec.free_string = fm_source_btn_text;
 
-    set_obj(fm_dlg, FM_CHANGEDIR_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 16*lm.cw, ybtn, 13*lm.cw, lm.rh);
-    fm_dlg[FM_CHANGEDIR_BTN].ob_spec.free_string = " Change Dir ";
+    set_obj(fm_dlg, FM_DIRUP_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 15*lm.cw, ybtn, 13*lm.cw, lm.rh);
+    fm_dlg[FM_DIRUP_BTN].ob_spec.free_string = "   Dir Up   ";
 
-    set_obj(fm_dlg, FM_START_BTN, G_BUTTON, EXIT | DEFAULT | TOUCHEXIT, NORMAL, 30*lm.cw, ybtn, 9*lm.cw, lm.rh);
+    set_obj(fm_dlg, FM_START_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 29*lm.cw, ybtn, 9*lm.cw, lm.rh);
     fm_dlg[FM_START_BTN].ob_spec.free_string = "  Start  ";
 
-    set_obj(fm_dlg, FM_QUIT_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, 40*lm.cw, ybtn, 8*lm.cw, lm.rh);
+    set_obj(fm_dlg, FM_QUIT_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 39*lm.cw, ybtn, 8*lm.cw, lm.rh);
     fm_dlg[FM_QUIT_BTN].ob_spec.free_string = " Quit  ";
+
+    /* Far right, reserved for pagination (Step 3+) -- no paging logic
+     * behind these yet, see FM_PREV_BTN/FM_NEXT_BTN's own comment.
+     * Anchored from the RIGHT edge of the real DW (not a fixed
+     * char-multiple from the left) so they sit flush against the actual
+     * right edge of the dialog regardless of what cw turns out to be at
+     * runtime -- see this function's own top-of-function comment. */
+    {
+        int next_w = 8*lm.cw, prev_w = 8*lm.cw, btn_gap = 1*lm.cw;
+        int x_next = DW - xl - next_w;
+        int x_prev = x_next - btn_gap - prev_w;
+
+        set_obj(fm_dlg, FM_PREV_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, x_prev, ybtn, prev_w, lm.rh);
+        fm_dlg[FM_PREV_BTN].ob_spec.free_string = "  Prev  ";
+
+        set_obj(fm_dlg, FM_NEXT_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, x_next, ybtn, next_w, lm.rh);
+        fm_dlg[FM_NEXT_BTN].ob_spec.free_string = "  Next  ";
+    }
 
     wire_tree(fm_dlg, FM_NOBJS);
 }
 
-/* Repopulates the title, source/directory lines, and the (mock) file
- * list, and always clears any file selection -- called on startup and
- * after every Source/Change Dir action, per the task brief's "wis een
- * eventueel geselecteerd image... maak Start opnieuw inactief" rule. */
-static void fm_refresh(const ProfileConfig *cfg)
+/* Repopulates fm_row_text[] from fm_entries[]/fm_entry_count and
+ * fm_title_text from fm_cwd -- the part of a refresh that never needs to
+ * touch the browse session itself (BROWSE_OPEN/GET_*_PAGE), just render
+ * whatever is already loaded. Used both by fm_refresh() (after a full
+ * open+load) and directly after a navigation action (CHANGE_DIR) that
+ * already updated fm_cwd/fm_entries itself.
+ *
+ * Directories are prefixed with the ST system font's own small folder
+ * glyph (character 0x06, confirmed by inspecting the actual font in the
+ * emulator -- the same icon the Atari desktop itself uses for a folder)
+ * plus one space; files get two plain spaces in its place so every name,
+ * directory or file, still lines up in the same text column. */
+#define FM_DIR_ICON '\x06'
+static void fm_apply_entries_to_rows(void)
 {
-    const Profile *p;
-    char dir[PROFILE_LASTDIR_LEN];
     int i;
-    int have_active = (cfg->active_index >= 0 && cfg->active_index < MAX_PROFILES
-                        && profile_slot_is_configured(&cfg->profiles[cfg->active_index]));
 
-    if (have_active) {
-        p = &cfg->profiles[cfg->active_index];
-        profile_current_dir(p, dir, sizeof(dir));
-        /* The dialog title IS the current directory -- see fm_dialog_init()'s
-         * own comment on why this replaced a static "FLOPPY.PRG" title. */
-        sprintf(fm_title_text, "%.76s", dir);
-        sprintf(fm_source_line, "Source: %-.20s   Type: %s", p->nickname, profile_backend_word(p));
-        sprintf(fm_source_btn_text, "Source: %s", profile_backend_word(p));
-    } else {
-        /* No profile configured yet -- "/Floppies" is the placeholder
-         * shown until a real source/directory exists, per the task
-         * brief's own example. */
-        strncpy(fm_title_text, "/Floppies", FM_TITLE_BUF - 1);
-        fm_title_text[FM_TITLE_BUF - 1] = '\0';
-        sprintf(fm_source_line, "Source: (none selected)");
-        strncpy(fm_source_btn_text, "Source", sizeof(fm_source_btn_text) - 1);
-        fm_source_btn_text[sizeof(fm_source_btn_text) - 1] = '\0';
-    }
-
-    /* MOCK DATA -- see this file's own "Mock file/directory browser data"
-     * block above; the real directory contents replace MOCK_FILES here in
-     * Step 2. Filename only, no size column: the whole point of the
-     * 76-character row width is showing the full (LFN) filename, per the
-     * task brief. */
+    sprintf(fm_title_text, "%.76s", fm_cwd);
     for (i = 0; i < FM_MAX_VISIBLE_FILES; i++) {
-        if (have_active && i < MOCK_FILE_COUNT) {
-            sprintf(fm_row_text[i], "%.76s", MOCK_FILES[i].name);
+        if (i < fm_entry_count) {
+            if (fm_entries[i].is_dir)
+                sprintf(fm_row_text[i], "%c %.74s", FM_DIR_ICON, fm_entries[i].name);
+            else
+                sprintf(fm_row_text[i], "  %.74s", fm_entries[i].name);
             fm_dlg[FM_ROW(i)].ob_flags &= (unsigned short)(~HIDETREE);
         } else {
             fm_dlg[FM_ROW(i)].ob_flags |= (unsigned short)HIDETREE;
@@ -1548,6 +1618,41 @@ static void fm_refresh(const ProfileConfig *cfg)
         fm_dlg[FM_ROW(i)].ob_state &= (unsigned short)(~SELECTED);
     }
     fm_selected_row = -1;
+}
+
+static void fm_refresh(ProfileConfig *cfg)
+{
+    const Profile *p;
+    int have_active = (cfg->active_index >= 0 && cfg->active_index < MAX_PROFILES
+                        && profile_slot_is_configured(&cfg->profiles[cfg->active_index]));
+
+    if (have_active) {
+        p = &cfg->profiles[cfg->active_index];
+        sprintf(fm_source_line, "Source: %-.20s   Type: %s", p->nickname, profile_backend_word(p));
+        sprintf(fm_source_btn_text, "Source: %s", profile_backend_word(p));
+
+        if (fm_open_browse_for_active_profile(cfg)) {
+            fm_load_entries();
+        } else {
+            fm_entry_count = 0;
+            strncpy(fm_cwd, "/", sizeof(fm_cwd) - 1);
+            fm_cwd[sizeof(fm_cwd) - 1] = '\0';
+        }
+    } else {
+        /* No profile configured yet -- "/Floppies" is the placeholder
+         * shown until a real source/directory exists, per the task
+         * brief's own example. */
+        fm_browse_ok = 0;
+        fm_browse_profile_index = -1;
+        fm_entry_count = 0;
+        strncpy(fm_cwd, "/Floppies", sizeof(fm_cwd) - 1);
+        fm_cwd[sizeof(fm_cwd) - 1] = '\0';
+        sprintf(fm_source_line, "Source: (none selected)");
+        strncpy(fm_source_btn_text, "Source", sizeof(fm_source_btn_text) - 1);
+        fm_source_btn_text[sizeof(fm_source_btn_text) - 1] = '\0';
+    }
+
+    fm_apply_entries_to_rows();
 }
 
 /* STEP 1.x STUB -- there is no floppy mount/emulation yet (explicitly out
@@ -1561,27 +1666,27 @@ static void fm_refresh(const ProfileConfig *cfg)
 static void fm_start_selected(const ProfileConfig *cfg)
 {
     const Profile *p;
-    char dir[PROFILE_LASTDIR_LEN];
     char msg[400];
 
-    if (fm_selected_row < 0 || fm_selected_row >= MOCK_FILE_COUNT)
+    if (fm_selected_row < 0 || fm_selected_row >= fm_entry_count)
         return; /* Start with no selection: do nothing, matches the task brief */
+    if (fm_entries[fm_selected_row].is_dir)
+        return; /* a directory row is navigated (see dialog_run()'s double-click handling), never "started" */
 
     p = &cfg->profiles[cfg->active_index];
-    profile_current_dir(p, dir, sizeof(dir));
 
     sprintf(msg, "[1][Would start:|%-.20s (%s)|%-.60s/|%-.30s][OK]",
-            p->nickname, profile_backend_word(p), dir, MOCK_FILES[fm_selected_row].name);
+            p->nickname, profile_backend_word(p), fm_cwd, fm_entries[fm_selected_row].name);
     form_alert(1, msg);
 }
 
 /* Custom event loop instead of form_do(): needed for two things form_do()
- * alone cannot provide -- up/down arrow-key list navigation, and (via
- * list_dialog_click()) double-click detection on a file row. Adapted from
- * the same evnt_multi()-based pattern SIDETNFS-Config's
- * sw_form_do_ticking() already established as this codebase's way to add
- * behavior beyond form_do()'s defaults. */
-static short fm_form_do_events(const DialogGeometry *geo, int *out_double)
+ * alone cannot provide -- up/down arrow-key list navigation, and
+ * double-click detection on a file row. Adapted from the same
+ * evnt_multi()-based pattern SIDETNFS-Config's sw_form_do_ticking()
+ * already established as this codebase's way to add behavior beyond
+ * form_do()'s defaults. */
+static short fm_form_do_events(int *out_double)
 {
     short mx, my, mb, ks, kr, br;
     short msg[8];
@@ -1621,7 +1726,7 @@ static short fm_form_do_events(const DialogGeometry *geo, int *out_double)
              * byte is the scan code, low byte the ASCII value (0 for
              * non-ASCII keys like the arrows). */
             int scan = (kr >> 8) & 0x00FF;
-            int visible_count = (MOCK_FILE_COUNT < FM_MAX_VISIBLE_FILES) ? MOCK_FILE_COUNT : FM_MAX_VISIBLE_FILES;
+            int visible_count = fm_entry_count;
 
             if (visible_count > 0 && (scan == 0x48 || scan == 0x50)) { /* up / down */
                 int new_row = fm_selected_row;
@@ -1630,11 +1735,24 @@ static short fm_form_do_events(const DialogGeometry *geo, int *out_double)
                 else /* down */
                     new_row = (new_row < 0) ? 0 : ((new_row + 1 >= visible_count) ? visible_count - 1 : new_row + 1);
 
-                if (fm_selected_row >= 0)
-                    fm_dlg[FM_ROW(fm_selected_row)].ob_state &= (unsigned short)(~SELECTED);
-                fm_dlg[FM_ROW(new_row)].ob_state |= (unsigned short)SELECTED;
-                fm_selected_row = new_row;
-                objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo->x, geo->y, geo->w, geo->h);
+                /* Let form_button() do the highlight toggle -- same call
+                 * the mouse-click path relies on (see fm_form_do_events()'s
+                 * MU_BUTTON handling above). A first attempt here toggled
+                 * the SELECTED bit by hand and redrew each row with a plain
+                 * objc_draw(), which looked right for the newly-selected
+                 * row but left the previously-selected row as a solid
+                 * black bar: G_STRING has no fill of its own, so a "plain"
+                 * redraw only re-draws the text glyphs (in black) on top of
+                 * whatever is already there -- and what was already there
+                 * was the SELECTED highlight's black fill, never erased.
+                 * form_button() flips the highlight the way AES actually
+                 * expects (an invert that undoes itself), which is exactly
+                 * why the mouse path never had this problem. */
+                if (new_row != fm_selected_row) {
+                    short next = (short)FM_ROW(new_row);
+                    form_button(fm_dlg, FM_ROW(new_row), 1, &next);
+                    fm_selected_row = new_row;
+                }
                 /* result stays -1: handled here, keep looping */
             }
         }
@@ -1650,9 +1768,6 @@ void dialog_run(ProfileConfig *cfg)
     int done;
     int is_double;
     int selector_result;
-    char dir[PROFILE_LASTDIR_LEN];
-    char root[PROFILE_LASTDIR_LEN];
-    const Profile *p;
 
     shared_fields_init();
 
@@ -1662,44 +1777,90 @@ void dialog_run(ProfileConfig *cfg)
 
     fm_dialog_init();
     fm_refresh(cfg);
-    dialog_open(fm_dlg, FM_ROOT, &geo);
+    dialog_open(fm_dlg, FM_ROOT, &geo, fm_short_screen);
 
     done = 0;
     while (!done) {
-        which = fm_form_do_events(&geo, &is_double);
+        which = fm_form_do_events(&is_double);
 
         if (which >= FM_ROW_BASE && which < FM_AFTER_ROWS) {
+            /* form_button() (inside fm_form_do_events()) already toggled
+             * SELECTED on this row -- and, being a member of an RBUTTON
+             * family, deselected whichever row was selected before -- and
+             * already redrew just those one or two row objects itself, the
+             * normal GEM AES way. No objc_draw() here: redrawing the whole
+             * FM_ROOT again on every single click was pure redundant work,
+             * and on real (slow) hardware that redundant full-dialog
+             * repaint was the visible flicker the user reported. */
             fm_selected_row = which - FM_ROW_BASE;
-            objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
-            if (is_double)
-                fm_start_selected(cfg);
+            if (is_double) {
+                if (fm_selected_row < fm_entry_count && fm_entries[fm_selected_row].is_dir) {
+                    /* Double-click on a directory row navigates into it --
+                     * fm_change_dir() itself updates fm_gen/fm_cwd/
+                     * last_directory on success and leaves them untouched
+                     * on failure (already alerted). */
+                    /* Busy cursor for the whole "go fetch the new
+                     * directory over TNFS/SD and rebuild the row list"
+                     * span -- an hourglass while it's working, back to the
+                     * normal arrow only once the new screen is actually on
+                     * screen, so a double-click always gives immediate
+                     * feedback that it registered instead of the UI just
+                     * sitting there for however long the round trip takes. */
+                    graf_mouse(HOURGLASS, 0L);
+                    if (fm_change_dir(cfg, 0, fm_entries[fm_selected_row].name)) {
+                        fm_load_entries();
+                        fm_apply_entries_to_rows();
+                    }
+                    objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+                    graf_mouse(ARROW, 0L);
+                } else {
+                    fm_start_selected(cfg);
+                }
+            }
             continue;
         }
 
         switch (which) {
         case FM_SOURCE_BTN:
+            /* server_selector_run()/edit_servers_run() are themselves
+             * interactive dialogs -- the user is choosing, not waiting on
+             * the Pico, so they keep the normal arrow. The busy cursor
+             * only brackets fm_refresh()'s own TNFS/SD round trip and the
+             * resulting redraw. */
             selector_result = server_selector_run(cfg);
             if (selector_result == 2)
                 edit_servers_run(cfg);
+            graf_mouse(HOURGLASS, 0L);
             fm_refresh(cfg);
             objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            graf_mouse(ARROW, 0L);
             break;
 
-        case FM_CHANGEDIR_BTN:
+        case FM_DIRUP_BTN:
+            /* Replaces the old separate Change Dir dialog's ".." row --
+             * directories now show inline in the main row list (see
+             * fm_apply_entries_to_rows()), so the only thing that dialog
+             * still did that the row list itself can't is go up one level.
+             * One button for that, no intermediate dialog. */
             if (cfg->active_index >= 0 && cfg->active_index < MAX_PROFILES
-                && profile_slot_is_configured(&cfg->profiles[cfg->active_index])) {
-                p = &cfg->profiles[cfg->active_index];
-                profile_current_dir(p, dir, sizeof(dir));
-                profile_root_dir(p, root, sizeof(root));
-                if (cd_run(dir, root)) {
-                    strncpy(cfg->profiles[cfg->active_index].last_directory, dir, PROFILE_LASTDIR_LEN - 1);
-                    cfg->profiles[cfg->active_index].last_directory[PROFILE_LASTDIR_LEN - 1] = '\0';
-                    fm_refresh(cfg);
+                && profile_slot_is_configured(&cfg->profiles[cfg->active_index]) && fm_browse_ok) {
+                char root[PROFILE_LASTDIR_LEN];
+
+                profile_root_dir(&cfg->profiles[cfg->active_index], root, sizeof(root));
+                if (strcmp(fm_cwd, root) == 0) {
+                    form_alert(1, "[3][Already at the top|directory.][OK]");
+                } else {
+                    graf_mouse(HOURGLASS, 0L);
+                    if (fm_change_dir(cfg, 1, NULL)) {
+                        fm_load_entries();
+                        fm_apply_entries_to_rows();
+                    }
+                    objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+                    graf_mouse(ARROW, 0L);
                 }
             } else {
                 form_alert(1, "[3][No source selected.][OK]");
             }
-            objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
             break;
 
         case FM_START_BTN:
@@ -1707,6 +1868,12 @@ void dialog_run(ProfileConfig *cfg)
                 form_alert(1, "[3][No image selected.][OK]");
             else
                 fm_start_selected(cfg);
+            break;
+
+        case FM_PREV_BTN:
+        case FM_NEXT_BTN:
+            /* Reserved for pagination (Step 3+) -- intentionally a no-op
+             * for now, see FM_PREV_BTN/FM_NEXT_BTN's own comment. */
             break;
 
         case FM_QUIT_BTN:

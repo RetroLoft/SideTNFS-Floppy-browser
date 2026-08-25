@@ -57,6 +57,61 @@
  * A firmware still reporting 1 predates the SD backend entirely. */
 #define FLOPPY_CONFIG_PROTOCOL_VERSION 2UL
 
+/* Step 2 -- real LFN directory browser (GEMDRVEMUL_FLOPPY_BROWSE_*,
+ * subcommands 0x23-0x26, SideTNFS-Firmware romemul/include/commands.h,
+ * floppyemu branch). Entirely separate status space from FLOPPY_STATUS_*
+ * above -- mirrors sidetnfs_floppy_browse_status_t
+ * (romemul/include/sidetnfs_floppy_browse.h) value-for-value. This is a
+ * pure protocol client, same layering as the rest of this file: it knows
+ * nothing about the UI's file-list widgets. */
+#define FLOPPY_BROWSE_OK                        0
+#define FLOPPY_BROWSE_ERR_INVALID_PROFILE       1
+#define FLOPPY_BROWSE_ERR_SOURCE_NOT_CONFIGURED 2
+#define FLOPPY_BROWSE_ERR_TNFS_NOT_CONNECTED    3
+#define FLOPPY_BROWSE_ERR_TNFS_HOST_UNREACHABLE 4
+#define FLOPPY_BROWSE_ERR_SD_NOT_PRESENT        5
+#define FLOPPY_BROWSE_ERR_DIR_NOT_FOUND         6
+#define FLOPPY_BROWSE_ERR_ACCESS_DENIED         7
+#define FLOPPY_BROWSE_ERR_PATH_TOO_LONG         8
+#define FLOPPY_BROWSE_ERR_NAME_TOO_LONG         9
+#define FLOPPY_BROWSE_ERR_INVALID_PAGE_REQUEST  10
+#define FLOPPY_BROWSE_STATUS_END_OF_DIRECTORY   11 /* not a hard error -- a well-formed, valid-empty page */
+#define FLOPPY_BROWSE_ERR_STALE_GENERATION      12
+#define FLOPPY_BROWSE_ERR_BACKEND_ERROR         13
+#define FLOPPY_BROWSE_ERR_NOT_OPEN              14
+/* NOT an error: floppy_probe_browse_get_dir_page()/_get_file_page() poll
+ * this internally and never return it to their own caller -- a TNFS walk
+ * that needs more than a handful of round trips is resumed across several
+ * GET_*_PAGE requests rather than blocking the firmware's dispatch loop
+ * for a long stretch (see sidetnfs_floppy_browse.h). Listed here only so
+ * the status space matches the firmware's enum value-for-value. */
+#define FLOPPY_BROWSE_STATUS_IN_PROGRESS        15
+
+#define FLOPPY_BROWSE_CWD_LEN      256 /* matches FLOPPY_BROWSE_CWD_LEN, sidetnfs_floppy_browse.h */
+#define FLOPPY_BROWSE_NAME_LEN     256 /* matches FLOPPY_BROWSE_NAME_LEN, sidetnfs_floppy_browse.h */
+#define FLOPPY_BROWSE_PAGE_ENTRIES 25  /* matches FLOPPY_BROWSE_PAGE_ENTRIES, sidetnfs_floppy_browse.h */
+
+typedef struct {
+    unsigned long status;     /* FLOPPY_BROWSE_* */
+    unsigned long generation; /* echo this back on every subsequent CHANGE_DIR/GET_*_PAGE call */
+    char cwd[FLOPPY_BROWSE_CWD_LEN];
+} FloppyBrowseResult;
+
+/* entries beyond `count` are zeroed by the firmware -- never assume
+ * leftover content from an earlier page. Atari ST RAM is not the tight
+ * resource the Pico's is (see profile.h's own note), so this struct keeps
+ * the full 25x256 page in one plain array rather than trying to save
+ * space. */
+typedef struct {
+    unsigned long status;     /* FLOPPY_BROWSE_* -- FLOPPY_BROWSE_STATUS_END_OF_DIRECTORY is not an error */
+    unsigned long generation;
+    unsigned long page_index;
+    unsigned int count;    /* 0..FLOPPY_BROWSE_PAGE_ENTRIES */
+    unsigned int has_prev;
+    unsigned int has_next;
+    char entries[FLOPPY_BROWSE_PAGE_ENTRIES][FLOPPY_BROWSE_NAME_LEN];
+} FloppyPageResult;
+
 typedef struct {
     unsigned long protocol_version;
     unsigned long max_profiles;
@@ -101,5 +156,14 @@ int floppy_probe_set_profile(unsigned long index, const FloppyProfileInfo *in, u
 int floppy_probe_delete_profile(unsigned long index, unsigned long *out_status);
 int floppy_probe_set_active_profile(unsigned long index, unsigned long *out_status);
 int floppy_probe_save_profiles(unsigned long *out_status);
+
+/* Step 2 browser. All four return FLOPPY_PROBE_OK/FLOPPY_PROBE_TIMEOUT for
+ * the communication result, same convention as every function above --
+ * out->status carries the real browse result and must always be checked
+ * separately, including on FLOPPY_PROBE_OK. */
+int floppy_probe_browse_open(unsigned long profile_index, FloppyBrowseResult *out);
+int floppy_probe_browse_change_dir(unsigned long generation, int go_up, const char *name, FloppyBrowseResult *out);
+int floppy_probe_browse_get_dir_page(unsigned long generation, unsigned long page_index, FloppyPageResult *out);
+int floppy_probe_browse_get_file_page(unsigned long generation, unsigned long page_index, FloppyPageResult *out);
 
 #endif
