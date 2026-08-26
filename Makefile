@@ -14,15 +14,6 @@ TARGET      = FLOPPY.PRG
 SRCS        = src/main.c src/profile.c src/floppy_probe.c src/dialog.c
 INSTALLDIR  = /mnt/retroloft/retro/Atari.ST/CONFIG
 
-# Step 2 temporary protocol test driver (src/floptest.c) -- plain GEMDOS
-# console program, no AES/-lgem needed. NOT part of 'all': it is not the
-# final Step 3 browser and must not clutter the shared CONFIG disk on
-# every ordinary FLOPPY.PRG build. Build/install explicitly with
-# 'make floptest'; delete this target (and src/floptest.c) once Step 3
-# wires the real browser into dialog.c -- see the Step 2 report.
-TESTTARGET  = FLOPTEST.PRG
-TESTSRCS    = src/floptest.c src/floppy_probe.c
-
 # 'all' always installs too, same convention SideTNFS-Config's own
 # Makefile uses: every successful build is copied straight to the CONFIG
 # share, no separate 'make install' step needed.
@@ -34,15 +25,7 @@ $(TARGET): $(SRCS)
 install: $(TARGET)
 	cp -v $(TARGET) $(INSTALLDIR)/
 
-floptest: $(TESTTARGET) install-floptest
-
-$(TESTTARGET): $(TESTSRCS)
-	$(CC) $(CFLAGS) -o $(TESTTARGET) $(TESTSRCS) -s
-
-install-floptest: $(TESTTARGET)
-	cp -v $(TESTTARGET) $(INSTALLDIR)/
-
 clean:
-	rm -f $(TARGET) $(TESTTARGET)
+	rm -f $(TARGET)
 
-.PHONY: all install clean floptest install-floptest
+.PHONY: all install clean

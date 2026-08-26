@@ -79,29 +79,36 @@
 #define FLOPPY_BROWSE_ERR_STALE_GENERATION      12
 #define FLOPPY_BROWSE_ERR_BACKEND_ERROR         13
 #define FLOPPY_BROWSE_ERR_NOT_OPEN              14
-/* NOT an error: floppy_probe_browse_get_dir_page()/_get_file_page() poll
- * this internally and never return it to their own caller -- a TNFS walk
- * that needs more than a handful of round trips is resumed across several
- * GET_*_PAGE requests rather than blocking the firmware's dispatch loop
- * for a long stretch (see sidetnfs_floppy_browse.h). Listed here only so
- * the status space matches the firmware's enum value-for-value. */
+/* NOT an error: floppy_probe_browse_get_page() polls this internally and
+ * never returns it to its own caller -- a TNFS walk that needs more than a
+ * handful of round trips is resumed across several GET_PAGE requests
+ * rather than blocking the firmware's dispatch loop for a long stretch
+ * (see sidetnfs_floppy_browse.h). Listed here only so the status space
+ * matches the firmware's enum value-for-value. */
 #define FLOPPY_BROWSE_STATUS_IN_PROGRESS        15
 
 #define FLOPPY_BROWSE_CWD_LEN      256 /* matches FLOPPY_BROWSE_CWD_LEN, sidetnfs_floppy_browse.h */
 #define FLOPPY_BROWSE_NAME_LEN     256 /* matches FLOPPY_BROWSE_NAME_LEN, sidetnfs_floppy_browse.h */
-#define FLOPPY_BROWSE_PAGE_ENTRIES 25  /* matches FLOPPY_BROWSE_PAGE_ENTRIES, sidetnfs_floppy_browse.h */
+#define FLOPPY_BROWSE_PAGE_ENTRIES 15  /* matches FLOPPY_BROWSE_PAGE_ENTRIES, sidetnfs_floppy_browse.h -- also FM_MAX_VISIBLE_FILES (dialog.c), one firmware page IS one screen now */
 
 typedef struct {
     unsigned long status;     /* FLOPPY_BROWSE_* */
-    unsigned long generation; /* echo this back on every subsequent CHANGE_DIR/GET_*_PAGE call */
+    unsigned long generation; /* echo this back on every subsequent CHANGE_DIR/GET_PAGE call */
     char cwd[FLOPPY_BROWSE_CWD_LEN];
 } FloppyBrowseResult;
 
 /* entries beyond `count` are zeroed by the firmware -- never assume
  * leftover content from an earlier page. Atari ST RAM is not the tight
  * resource the Pico's is (see profile.h's own note), so this struct keeps
- * the full 25x256 page in one plain array rather than trying to save
- * space. */
+ * the full 15x256 page in one plain array rather than trying to save
+ * space.
+ *
+ * Step 3: GET_DIR_PAGE/GET_FILE_PAGE were combined into one GET_PAGE --
+ * the firmware itself now returns one page of up to FLOPPY_BROWSE_PAGE_ENTRIES
+ * entries, directories always sorted before files within the page, so the
+ * Atari side no longer fetches two separate pages and stitches them
+ * together (see dialog.c's old fm_load_entries() for the pre-Step-3
+ * approach). is_dir[i] tells the two apart, index-matched with entries[i]. */
 typedef struct {
     unsigned long status;     /* FLOPPY_BROWSE_* -- FLOPPY_BROWSE_STATUS_END_OF_DIRECTORY is not an error */
     unsigned long generation;
@@ -110,6 +117,7 @@ typedef struct {
     unsigned int has_prev;
     unsigned int has_next;
     char entries[FLOPPY_BROWSE_PAGE_ENTRIES][FLOPPY_BROWSE_NAME_LEN];
+    int is_dir[FLOPPY_BROWSE_PAGE_ENTRIES]; /* 1 = directory, 0 = file */
 } FloppyPageResult;
 
 typedef struct {
@@ -157,13 +165,14 @@ int floppy_probe_delete_profile(unsigned long index, unsigned long *out_status);
 int floppy_probe_set_active_profile(unsigned long index, unsigned long *out_status);
 int floppy_probe_save_profiles(unsigned long *out_status);
 
-/* Step 2 browser. All four return FLOPPY_PROBE_OK/FLOPPY_PROBE_TIMEOUT for
+/* Step 2/3 browser. All return FLOPPY_PROBE_OK/FLOPPY_PROBE_TIMEOUT for
  * the communication result, same convention as every function above --
  * out->status carries the real browse result and must always be checked
  * separately, including on FLOPPY_PROBE_OK. */
 int floppy_probe_browse_open(unsigned long profile_index, FloppyBrowseResult *out);
 int floppy_probe_browse_change_dir(unsigned long generation, int go_up, const char *name, FloppyBrowseResult *out);
-int floppy_probe_browse_get_dir_page(unsigned long generation, unsigned long page_index, FloppyPageResult *out);
-int floppy_probe_browse_get_file_page(unsigned long generation, unsigned long page_index, FloppyPageResult *out);
+/* One combined page (dirs sorted before files, see FloppyPageResult's own
+ * comment) -- replaces the old separate get_dir_page()/get_file_page(). */
+int floppy_probe_browse_get_page(unsigned long generation, unsigned long page_index, FloppyPageResult *out);
 
 #endif

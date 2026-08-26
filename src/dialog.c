@@ -1213,6 +1213,8 @@ typedef struct {
 } FmEntry;
 static FmEntry fm_entries[FM_MAX_VISIBLE_FILES];
 static int fm_entry_count;
+static unsigned long fm_page_index; /* current GET_PAGE page, reset to 0 on open/navigate */
+static int fm_has_prev, fm_has_next; /* from the last fm_load_entries() call -- drives FM_PREV_BTN/FM_NEXT_BTN's enabled state */
 
 /* ================================================================== */
 /* Profile source/path helpers                                         */
@@ -1272,63 +1274,49 @@ static int fm_open_browse_for_active_profile(ProfileConfig *cfg)
     return 1;
 }
 
-/* Fills fm_entries[]/fm_entry_count from page 0 of the active CWD's
- * directory listing (first, up to FM_MAX_VISIBLE_FILES) then, if room is
- * left, page 0 of the file listing -- no pagination yet (Step 3), so a
- * directory with more entries than fit just shows its first
- * FM_MAX_VISIBLE_FILES dirs-then-files and nothing beyond that. A
- * FLOPPY_PROBE_OK communication result with a non-OK/non-END_OF_DIRECTORY
- * browse status is alerted once; count is always trustworthy as 0 in
- * every error case (sidetnfs_floppy_browse_get_page()'s own contract), so
- * the list is simply left empty rather than guessed at. */
+/* Fills fm_entries[]/fm_entry_count from page fm_page_index of the active
+ * CWD's combined dirs-then-files listing -- the firmware returns one page
+ * (dirs always sorted before files within it, see FloppyPageResult's own
+ * comment), one round trip, up to FLOPPY_BROWSE_PAGE_ENTRIES entries
+ * (which is exactly FM_MAX_VISIBLE_FILES -- one firmware page IS one
+ * screen). Also refreshes fm_has_prev/fm_has_next from the page result --
+ * callers that change fm_page_index (Prev/Next) or reset it to 0 (open,
+ * navigate) must call this again afterward, same as they already do for
+ * fm_entries/fm_entry_count. A FLOPPY_PROBE_OK communication result with a
+ * non-OK/non-END_OF_DIRECTORY browse status is alerted once; count is
+ * always trustworthy as 0 in every error case
+ * (sidetnfs_floppy_browse_get_page()'s own contract), so the list is
+ * simply left empty rather than guessed at. */
 static void fm_load_entries(void)
 {
-    FloppyPageResult dp, fp;
+    FloppyPageResult p;
     int i, n;
 
     fm_entry_count = 0;
+    fm_has_prev = fm_has_next = 0;
     if (!fm_browse_ok)
         return;
 
-    if (floppy_probe_browse_get_dir_page(fm_gen, 0UL, &dp) != FLOPPY_PROBE_OK) {
+    if (floppy_probe_browse_get_page(fm_gen, fm_page_index, &p) != FLOPPY_PROBE_OK) {
         form_alert(1, "[3][Could not reach the|cartridge (timeout).][OK]");
         return;
     }
-    if (dp.status != FLOPPY_BROWSE_OK && dp.status != FLOPPY_BROWSE_STATUS_END_OF_DIRECTORY) {
+    if (p.status != FLOPPY_BROWSE_OK && p.status != FLOPPY_BROWSE_STATUS_END_OF_DIRECTORY) {
         char msg[96];
-        sprintf(msg, "[3][Could not list directories|(error %lu).][OK]", dp.status);
+        sprintf(msg, "[3][Could not list directory|(error %lu).][OK]", p.status);
         form_alert(1, msg);
         return;
     }
-    n = (int)dp.count;
+    fm_has_prev = p.has_prev ? 1 : 0;
+    fm_has_next = p.has_next ? 1 : 0;
+    n = (int)p.count;
     if (n > FM_MAX_VISIBLE_FILES) n = FM_MAX_VISIBLE_FILES;
     for (i = 0; i < n; i++) {
-        strncpy(fm_entries[fm_entry_count].name, dp.entries[i], FLOPPY_BROWSE_NAME_LEN - 1);
-        fm_entries[fm_entry_count].name[FLOPPY_BROWSE_NAME_LEN - 1] = '\0';
-        fm_entries[fm_entry_count].is_dir = 1;
-        fm_entry_count++;
+        strncpy(fm_entries[i].name, p.entries[i], FLOPPY_BROWSE_NAME_LEN - 1);
+        fm_entries[i].name[FLOPPY_BROWSE_NAME_LEN - 1] = '\0';
+        fm_entries[i].is_dir = p.is_dir[i];
     }
-
-    if (fm_entry_count >= FM_MAX_VISIBLE_FILES)
-        return;
-
-    if (floppy_probe_browse_get_file_page(fm_gen, 0UL, &fp) != FLOPPY_PROBE_OK) {
-        form_alert(1, "[3][Could not reach the|cartridge (timeout).][OK]");
-        return;
-    }
-    if (fp.status != FLOPPY_BROWSE_OK && fp.status != FLOPPY_BROWSE_STATUS_END_OF_DIRECTORY) {
-        char msg[96];
-        sprintf(msg, "[3][Could not list files|(error %lu).][OK]", fp.status);
-        form_alert(1, msg);
-        return;
-    }
-    n = (int)fp.count;
-    for (i = 0; i < n && fm_entry_count < FM_MAX_VISIBLE_FILES; i++) {
-        strncpy(fm_entries[fm_entry_count].name, fp.entries[i], FLOPPY_BROWSE_NAME_LEN - 1);
-        fm_entries[fm_entry_count].name[FLOPPY_BROWSE_NAME_LEN - 1] = '\0';
-        fm_entries[fm_entry_count].is_dir = 0;
-        fm_entry_count++;
-    }
+    fm_entry_count = n;
 }
 
 /* Navigates the active browse session: go_up=1 for ".." (name ignored),
@@ -1393,10 +1381,11 @@ enum {
 #define FM_DIRUP_BTN     (FM_AFTER_ROWS + 2)
 #define FM_START_BTN     (FM_AFTER_ROWS + 3)
 #define FM_QUIT_BTN      (FM_AFTER_ROWS + 4)
-/* Placeholder for future pagination (Step 3+) -- buttons only for now, no
- * paging logic wired in yet: GET_DIR_PAGE/GET_FILE_PAGE already support
- * an arbitrary page_index on the protocol/firmware side, but fm_load_entries()
- * only ever asks for page 0. Clicking either does nothing yet. */
+/* Placeholder for pagination -- buttons only for now, no paging logic
+ * wired in yet: GET_PAGE already supports an arbitrary page_index on the
+ * protocol/firmware side (one combined dirs-then-files page per call, see
+ * FloppyPageResult's own comment), but fm_load_entries() only ever asks
+ * for page 0. Clicking either does nothing yet. */
 #define FM_PREV_BTN      (FM_AFTER_ROWS + 5)
 #define FM_NEXT_BTN      (FM_AFTER_ROWS + 6)
 #define FM_NOBJS         (FM_AFTER_ROWS + 7)
@@ -1618,6 +1607,18 @@ static void fm_apply_entries_to_rows(void)
         fm_dlg[FM_ROW(i)].ob_state &= (unsigned short)(~SELECTED);
     }
     fm_selected_row = -1;
+
+    /* Same DISABLED convention already used elsewhere in this file (e.g.
+     * FS_ROW, FP_DELETE) -- greyed out and unclickable rather than a live
+     * button that would just alert "no such page" if clicked. */
+    if (fm_has_prev)
+        fm_dlg[FM_PREV_BTN].ob_state &= (unsigned short)(~DISABLED);
+    else
+        fm_dlg[FM_PREV_BTN].ob_state |= (unsigned short)DISABLED;
+    if (fm_has_next)
+        fm_dlg[FM_NEXT_BTN].ob_state &= (unsigned short)(~DISABLED);
+    else
+        fm_dlg[FM_NEXT_BTN].ob_state |= (unsigned short)DISABLED;
 }
 
 static void fm_refresh(ProfileConfig *cfg)
@@ -1625,6 +1626,8 @@ static void fm_refresh(ProfileConfig *cfg)
     const Profile *p;
     int have_active = (cfg->active_index >= 0 && cfg->active_index < MAX_PROFILES
                         && profile_slot_is_configured(&cfg->profiles[cfg->active_index]));
+
+    fm_page_index = 0;
 
     if (have_active) {
         p = &cfg->profiles[cfg->active_index];
@@ -1680,6 +1683,39 @@ static void fm_start_selected(const ProfileConfig *cfg)
     form_alert(1, msg);
 }
 
+/* objc_find() only matches a click that lands exactly inside a row's own
+ * rectangle -- the small gap between two rows (FM_MAX_VISIBLE_FILES rows
+ * are spaced lm.pitch = lm.rh+3 apart but are only lm.rh tall, see
+ * fm_dialog_init()) belongs to no object at all, so a click there is
+ * silently a miss. This is the fallback used only when objc_find() itself
+ * found nothing: it snaps to the nearest visible row if the click is
+ * within 1px of that row's own top/bottom edge, so a stray click just off
+ * a row still selects it. mx/my are absolute screen coordinates (as
+ * evnt_multi() reports them); FM_ROW(i)'s own ob_x/ob_y are relative to
+ * FM_ROOT (a flat, one-level tree, see wire_tree()), and FM_ROOT's own
+ * ob_x/ob_y already hold its absolute screen position (set by
+ * form_center()/dialog_open()) -- so the two are added together here to
+ * get each row's absolute rectangle. Returns a row index, or -1 if the
+ * click is nowhere near any visible row. */
+static int fm_row_near(short mx, short my)
+{
+    int i;
+    short root_x = fm_dlg[FM_ROOT].ob_x;
+    short root_y = fm_dlg[FM_ROOT].ob_y;
+
+    for (i = 0; i < fm_entry_count; i++) {
+        OBJECT *row = &fm_dlg[FM_ROW(i)];
+        short x = (short)(root_x + row->ob_x);
+        short y = (short)(root_y + row->ob_y);
+
+        if (mx < x || mx >= x + row->ob_width)
+            continue;
+        if (my >= y - 1 && my < y + row->ob_height + 1)
+            return i;
+    }
+    return -1;
+}
+
 /* Custom event loop instead of form_do(): needed for two things form_do()
  * alone cannot provide -- up/down arrow-key list navigation, and
  * double-click detection on a file row. Adapted from the same
@@ -1706,6 +1742,11 @@ static short fm_form_do_events(int *out_double)
 
         if (event & MU_BUTTON) {
             obj = objc_find(fm_dlg, FM_ROOT, MAX_DEPTH, mx, my);
+            if (obj <= 0) {
+                int near = fm_row_near(mx, my);
+                if (near >= 0)
+                    obj = (short)FM_ROW(near);
+            }
             if (obj > 0) {
                 next = obj;
                 if (!form_button(fm_dlg, obj, br, &next)) {
@@ -1754,6 +1795,17 @@ static short fm_form_do_events(int *out_double)
                     fm_selected_row = new_row;
                 }
                 /* result stays -1: handled here, keep looping */
+            } else if (visible_count > 0 && (kr & 0x00FF) == 0x0D
+                       && fm_selected_row >= 0 && fm_selected_row < visible_count) {
+                /* Return/Enter on a selected row: same outcome as a
+                 * double-click on it (open the directory, or start the
+                 * file) -- reuses dialog_run()'s existing is_double
+                 * handling below rather than duplicating navigate/start
+                 * logic here. ASCII 0x0D, not the scan code, since GEM
+                 * already translates both the main Return key and the
+                 * numpad Enter key to the same ASCII value. */
+                result = (short)FM_ROW(fm_selected_row);
+                *out_double = 1;
             }
         }
     }
@@ -1808,6 +1860,7 @@ void dialog_run(ProfileConfig *cfg)
                      * sitting there for however long the round trip takes. */
                     graf_mouse(HOURGLASS, 0L);
                     if (fm_change_dir(cfg, 0, fm_entries[fm_selected_row].name)) {
+                        fm_page_index = 0;
                         fm_load_entries();
                         fm_apply_entries_to_rows();
                     }
@@ -1852,6 +1905,7 @@ void dialog_run(ProfileConfig *cfg)
                 } else {
                     graf_mouse(HOURGLASS, 0L);
                     if (fm_change_dir(cfg, 1, NULL)) {
+                        fm_page_index = 0;
                         fm_load_entries();
                         fm_apply_entries_to_rows();
                     }
@@ -1871,9 +1925,29 @@ void dialog_run(ProfileConfig *cfg)
             break;
 
         case FM_PREV_BTN:
+            /* fm_has_prev also gates the button's own DISABLED state (see
+             * fm_apply_entries_to_rows()) -- checked again here too since
+             * a DISABLED TOUCHEXIT button should never reach this dispatch
+             * in the first place, but a no-op double-guard costs nothing. */
+            if (fm_has_prev && fm_page_index > 0) {
+                fm_page_index--;
+                graf_mouse(HOURGLASS, 0L);
+                fm_load_entries();
+                fm_apply_entries_to_rows();
+                objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+                graf_mouse(ARROW, 0L);
+            }
+            break;
+
         case FM_NEXT_BTN:
-            /* Reserved for pagination (Step 3+) -- intentionally a no-op
-             * for now, see FM_PREV_BTN/FM_NEXT_BTN's own comment. */
+            if (fm_has_next) {
+                fm_page_index++;
+                graf_mouse(HOURGLASS, 0L);
+                fm_load_entries();
+                fm_apply_entries_to_rows();
+                objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+                graf_mouse(ARROW, 0L);
+            }
             break;
 
         case FM_QUIT_BTN:
