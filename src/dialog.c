@@ -215,6 +215,48 @@ static void dialog_close(DialogGeometry *geo)
     form_dial(FMD_FINISH, geo->x, geo->y, geo->w, geo->h, geo->x, geo->y, geo->w, geo->h);
 }
 
+/* Shared "full window" frame geometry: title line, a divider, one more
+ * header line, another divider, row_count rows, a third divider, one
+ * button row. Both the main browser (FM_*) and the Favorites dialog
+ * (FA_*) call this with the SAME row_count so their two windows are
+ * pixel-identical in size on every resolution -- including the
+ * medium-res-height "fullscreen, no border" treatment (short_screen
+ * below, meant to pair with dialog_open()'s own flush_topleft). FA is a
+ * different SCREEN within the app, not a differently-sized window; before
+ * this helper existed the two dialogs' geometry was hand-duplicated and
+ * drifted apart. */
+#define STD_FRAME_CHARS 78 /* character-cell width on any screen tall enough not to need the short-screen treatment below */
+
+typedef struct {
+    int DW, DH, xl, yt;
+    int ydiv1, ysecond, ydiv2, yrow0, ydiv3, ybtn;
+    int short_screen;
+    long root_spec; /* ob_spec.index for the G_BOX root -- border removed on a short screen, see fm_dialog_init()'s original comment on 0x00031070L/0x00001070L */
+} StdFrame;
+
+static void std_frame_get(StdFrame *f, const LayoutMetrics *lm, int row_count)
+{
+    f->short_screen = lm->short_screen;
+    f->DW = lm->short_screen ? lm->sw : (STD_FRAME_CHARS * lm->cw);
+    f->xl = lm->short_screen ? 1 : lm->cw;
+    f->yt = lm->short_screen ? 1 : lm->tm;
+    f->ydiv1 = f->yt + lm->rh + 1;
+    if (lm->short_screen) {
+        f->ysecond = f->yt + lm->rh + 1;
+        f->ydiv2   = f->ysecond + lm->rh + 1;
+        f->yrow0   = f->ydiv2 + 2 + 3;
+        f->ybtn    = f->yrow0 + row_count * lm->pitch + 2;
+    } else {
+        f->ysecond = f->ydiv1 + 5;
+        f->ydiv2   = f->ysecond + lm->rh + 2;
+        f->yrow0   = f->ydiv2 + 5;
+        f->ybtn    = f->yrow0 + row_count * lm->pitch + 2 + 7;
+    }
+    f->ydiv3 = f->yrow0 + row_count * lm->pitch + 2;
+    f->DH = lm->short_screen ? (f->ybtn + lm->rh + 1) : (f->ybtn + lm->rh + lm->tm + 3);
+    f->root_spec = lm->short_screen ? 0x00001070L : 0x00031070L;
+}
+
 /* One form_do() call plus the mandatory TOUCHEXIT mouse-release wait
  * (see the file header comment). Returns the clicked object's id. */
 static short dialog_click(OBJECT *tree, int start_obj)
@@ -1176,6 +1218,487 @@ static int server_selector_run(ProfileConfig *cfg)
     return result;
 }
 
+/* ================================================================== */
+/* Favorites dialog (FA_*)                                             */
+/* This is now the app's own top-level/home screen -- dialog_run() (FM_*   */
+/* section below) runs ITS loop directly rather than the browser's, and    */
+/* opens the browser (fm_browse_run()) as a NESTED call whenever [Browser] */
+/* is clicked, to go pick a file. A file confirmed there (double-click,    */
+/* Return/Enter, or the browser's own [Add] button) arms PLACE MODE       */
+/* on return; pressing [Back] there returns with nothing armed instead.    */
+/* No real favorites storage/move/delete/start behind any of this yet, per */
+/* this project's own task briefs so far. */
+/*                                                                       */
+/* Deliberately built to be pixel-identical in width/height to the main  */
+/* browser window (see std_frame_get(), factored out for exactly this   */
+/* purpose) -- including going borderless/fullscreen on a medium-res-    */
+/* height screen the same way. The visual "this is a different part of   */
+/* the app" signal comes from the CONTENT (tabs instead of a source      */
+/* line, a plain list instead of selectable rows, a different button     */
+/* row), not from a differently-shaped window -- and a same-shape window */
+/* means dialog placement/behavior never surprises the user switching    */
+/* between the two. The main window's own fm_dialog_init() is untouched  */
+/* by this -- std_frame_get() only mirrors its math, nothing calls into  */
+/* fm_dialog_init() itself.                                              */
+/*                                                                       */
+/* Rows are SELECTABLE|RBUTTON (same family FM_ROW uses) in NORMAL MODE:    */
+/* a single click selects (fa_selected_row) via AES's own object dispatch, */
+/* a double-click on an occupied slot shows a "Now starting <name>" stub   */
+/* alert (still no real mount/emulation behind it). In PLACE MODE, row     */
+/* clicks are instead hit-tested manually (fa_row_at()) and bypass AES     */
+/* dispatch entirely, since a row's meaning there is placement, not        */
+/* selection -- see the MU_BUTTON handling below for how the two are kept  */
+/* apart. PLACE MODE: opened already-armed with the browser's selected     */
+/* filename (fa_place_name), FLAT_HAND shown while the mouse is over the   */
+/* row list (MU_M1 enter/leave watch), and a row click stores the filename */
+/* into that favorite slot (fa_slots[]), redraws it, and returns to        */
+/* normal. Erase empties the selected slot, no confirmation (see           */
+/* fa_erase_selected()), same as the keyboard Delete key. Move arms MOVE   */
+/* MODE for the selected favorite -- same FLAT_HAND/row-click flow as      */
+/* PLACE MODE, just moving an existing favorite (fa_move_source_slot)      */
+/* instead of a browser filename, clearing the source slot once the        */
+/* destination row is clicked. Start shows the same "Now starting <name>"  */
+/* stub as double-click/Enter on the selected favorite (fa_start_selected()) */
+/* -- same "several ways to confirm" idiom the browser's own [Add]/        */
+/* double-click/Enter already use. Browser opens the nested browser (see   */
+/* above); Quit is the only button that actually ends this loop, exiting   */
+/* the whole program (dialog_run() returning to main.c's own appl_exit()). */
+/* ================================================================== */
+enum {
+    FA_ROOT = 0,
+    FA_TITLE,
+    FA_DIV1,
+    FA_TAB_BASE
+};
+#define FA_TAB_COUNT   4
+#define FA_TAB(i)      (FA_TAB_BASE + (i))
+#define FA_AFTER_TABS  (FA_TAB_BASE + FA_TAB_COUNT)
+#define FA_DIV2        (FA_AFTER_TABS + 0)
+#define FA_ROW_BASE    (FA_AFTER_TABS + 1)
+/* One favorites page = 15 slots, matching the task's own [01-15] mockup
+ * (and, not coincidentally, the browser's own one-screen page size --
+ * FA_ROWS is kept as its own independent constant rather than reusing
+ * FM_MAX_VISIBLE_FILES, defined further down, to keep this section
+ * self-contained). */
+#define FA_ROWS        15
+#define FA_ROW(i)      (FA_ROW_BASE + (i))
+#define FA_AFTER_ROWS  (FA_ROW_BASE + FA_ROWS)
+#define FA_DIV3        (FA_AFTER_ROWS + 0)
+#define FA_MOVE_BTN    (FA_AFTER_ROWS + 1)
+#define FA_ERASE_BTN   (FA_AFTER_ROWS + 2) /* empties the selected slot -- "Erase", not "Delete": nothing is thrown away, a slot just becomes free again */
+#define FA_START_BTN   (FA_AFTER_ROWS + 3)
+#define FA_BROWSER_BTN (FA_AFTER_ROWS + 4)
+/* Favorites is now the app's own top-level screen (dialog_run() runs ITS
+ * loop directly, opening the browser as a nested call on [Browser] --
+ * see dialog_run()'s own comment) -- so the program's actual Quit lives
+ * here now, not in the browser (which has a plain [Back] instead, see
+ * FM_BACK_BTN). Right-anchored from DW, same convention FM_PREV_BTN/
+ * FM_NEXT_BTN already use for right-aligned buttons. */
+#define FA_QUIT_BTN    (FA_AFTER_ROWS + 5)
+#define FA_NOBJS       (FA_AFTER_ROWS + 6)
+static OBJECT fa_dlg[FA_NOBJS];
+
+#define FA_TITLE_BUF 48
+static char fa_title_text[FA_TITLE_BUF];
+/* Content width matches the row object's own real width (STD_FRAME_CHARS,
+ * same derivation as FM_CONTENT_CHARS: dialog width minus a 1-char margin
+ * each side) -- fa_refresh_rows() always pads its text out to exactly this
+ * many characters, see that function's own comment for why. */
+#define FA_CONTENT_CHARS (STD_FRAME_CHARS - 2)
+#define FA_ROW_BUF (FA_CONTENT_CHARS + 1)
+static char fa_row_text[FA_ROWS][FA_ROW_BUF];
+static int fa_current_page; /* 0..FA_TAB_COUNT-1, which tab is showing -- mock data only, see fa_refresh_rows() */
+static int fa_short_screen; /* set by fa_dialog_init(), read by dialog_run() -- same role as fm_short_screen */
+static int fa_selected_row = -1; /* -1 = no favorite selected on the current page -- same role as fm_selected_row */
+
+static void fa_dialog_init(void)
+{
+    LayoutMetrics lm;
+    StdFrame f;
+    int tab_w, tab_gap;
+    int i;
+
+    layout_metrics_get(&lm);
+    /* std_frame_get() with the SAME row_count (FA_ROWS == FM_MAX_VISIBLE_FILES,
+     * both 15) reproduces the main browser's own frame geometry exactly --
+     * see this dialog's own header comment on why the two windows must be
+     * pixel-identical in size, and std_frame_get()'s own comment for the
+     * shared formula. The main window's own fm_dialog_init() is untouched
+     * and does not call this helper; std_frame_get() simply mirrors its
+     * math independently so fm_dialog_init() never has to change for this
+     * dialog to match it. */
+    std_frame_get(&f, &lm, FA_ROWS);
+    fa_short_screen = f.short_screen;
+
+    set_obj(fa_dlg, FA_ROOT, G_BOX, NONE, NORMAL, 0, 0, f.DW, f.DH);
+    fa_dlg[FA_ROOT].ob_spec.index = f.root_spec;
+
+    set_obj(fa_dlg, FA_TITLE, G_STRING, NONE, NORMAL, f.xl, f.yt, f.DW - 2*f.xl, lm.rh);
+    fa_dlg[FA_TITLE].ob_spec.free_string = fa_title_text;
+
+    /* FA_DIV1 (title/tabs separator) and FA_DIV3 (rows/buttons separator)
+     * are HIDETREE'd on a short screen, exactly like FM_DIV1/FM_DIV3 --
+     * see fm_dialog_init()'s own comment for why (still too tall at 15
+     * rows with every line in place; FA_DIV2 stays either way). Always
+     * set_obj()'d regardless, same real-hardware-crash reason as FM_DIV1/3. */
+    set_obj(fa_dlg, FA_DIV1, G_BOX, NONE, NORMAL, f.xl, f.ydiv1, f.DW - 2*f.xl, 2);
+    fa_dlg[FA_DIV1].ob_spec.index = 0x00001171L;
+    if (f.short_screen)
+        fa_dlg[FA_DIV1].ob_flags |= (unsigned short)HIDETREE;
+
+    tab_w = 12 * lm.cw;
+    tab_gap = lm.cw;
+    for (i = 0; i < FA_TAB_COUNT; i++) {
+        int tx = f.xl + i * (tab_w + tab_gap);
+        set_obj(fa_dlg, FA_TAB(i), G_BUTTON, EXIT | TOUCHEXIT, NORMAL, tx, f.ysecond, tab_w, lm.rh);
+    }
+    fa_dlg[FA_TAB(0)].ob_spec.free_string = " 01-15 ";
+    fa_dlg[FA_TAB(1)].ob_spec.free_string = " 16-30 ";
+    fa_dlg[FA_TAB(2)].ob_spec.free_string = " 31-45 ";
+    fa_dlg[FA_TAB(3)].ob_spec.free_string = " 46-60 ";
+
+    set_obj(fa_dlg, FA_DIV2, G_BOX, NONE, NORMAL, f.xl, f.ydiv2, f.DW - 2*f.xl, 2);
+    fa_dlg[FA_DIV2].ob_spec.index = 0x00001171L;
+
+    for (i = 0; i < FA_ROWS; i++) {
+        int ry = f.yrow0 + i * lm.pitch;
+        /* SELECTABLE | RBUTTON, same family FM_ROW uses -- selectable with
+         * a highlight, single-selection within the page (RBUTTON auto-
+         * deselects whichever row was selected before). NOT EXIT: a click
+         * only selects, form_button() reports it back to the caller
+         * instead of ending the dialog -- see dialog_run()'s own row
+         * handling below for what a single vs. double click then does. */
+        set_obj(fa_dlg, FA_ROW(i), G_STRING, SELECTABLE | RBUTTON, NORMAL, f.xl, ry, f.DW - 2*f.xl, lm.rh);
+        fa_dlg[FA_ROW(i)].ob_spec.free_string = fa_row_text[i];
+    }
+
+    set_obj(fa_dlg, FA_DIV3, G_BOX, NONE, NORMAL, f.xl, f.ydiv3, f.DW - 2*f.xl, 2);
+    fa_dlg[FA_DIV3].ob_spec.index = 0x00001171L;
+    if (f.short_screen)
+        fa_dlg[FA_DIV3].ob_flags |= (unsigned short)HIDETREE;
+
+    set_obj(fa_dlg, FA_MOVE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl, f.ybtn, 11*lm.cw, lm.rh);
+    fa_dlg[FA_MOVE_BTN].ob_spec.free_string = "  Move  ";
+
+    set_obj(fa_dlg, FA_ERASE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl + 12*lm.cw, f.ybtn, 11*lm.cw, lm.rh);
+    fa_dlg[FA_ERASE_BTN].ob_spec.free_string = " Erase  ";
+
+    set_obj(fa_dlg, FA_START_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl + 24*lm.cw, f.ybtn, 11*lm.cw, lm.rh);
+    fa_dlg[FA_START_BTN].ob_spec.free_string = " Start  ";
+
+    set_obj(fa_dlg, FA_BROWSER_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl + 36*lm.cw, f.ybtn, 13*lm.cw, lm.rh);
+    fa_dlg[FA_BROWSER_BTN].ob_spec.free_string = "  Browser  ";
+
+    {
+        int quit_w = 8 * lm.cw;
+        set_obj(fa_dlg, FA_QUIT_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.DW - f.xl - quit_w, f.ybtn, quit_w, lm.rh);
+        fa_dlg[FA_QUIT_BTN].ob_spec.free_string = " Quit  ";
+    }
+
+    wire_tree(fa_dlg, FA_NOBJS);
+}
+
+/* In-memory favorites model (this task) -- 60 slots (FA_TAB_COUNT pages of
+ * FA_ROWS each), one full filename buffer per slot, "" meaning empty.
+ * Lives for the life of the running program only: no FLOPPY.CFG/MOUNT.CFG,
+ * no load/save, explicitly out of scope for this task. Sized to the
+ * browser's own FLOPPY_BROWSE_NAME_LEN so the full selected filename is
+ * kept, never truncated in the model itself -- only fa_refresh_rows()'s
+ * own display copy is ever shortened to fit a row. */
+#define FA_TOTAL_SLOTS (FA_ROWS * FA_TAB_COUNT)
+static char fa_slots[FA_TOTAL_SLOTS][FLOPPY_BROWSE_NAME_LEN];
+
+/* Seeds the in-memory model with this task's own mockup demo content --
+ * ONCE, the first time the Favorites dialog is ever opened in this run, not
+ * on every open (placements made by the user must survive closing and
+ * reopening the dialog, see this task's own expected user flow). */
+static void fa_slots_seed_once(void)
+{
+    static const struct { int slot; const char *name; } demo[] = {
+        { 0,  "Dungeon Master (Europe) Disk 1" },
+        { 1,  "Dungeon Master (Europe) Disk 2" },
+        { 2,  "Lotus Esprit Turbo Challenge II" },
+        { 14, "Monkey Island Disk 4" },
+    };
+    static int seeded = 0;
+    int i;
+
+    if (seeded)
+        return;
+    seeded = 1;
+
+    for (i = 0; i < FA_TOTAL_SLOTS; i++)
+        fa_slots[i][0] = '\0';
+    for (i = 0; i < (int)(sizeof(demo) / sizeof(demo[0])); i++)
+        set_buf(fa_slots[demo[i].slot], FLOPPY_BROWSE_NAME_LEN, demo[i].name);
+}
+
+/* G_STRING objects have no fill of their own -- objc_draw() only paints
+ * glyphs on top of whatever is already on screen (same issue this file's
+ * own arrow-key row-highlight code ran into once already, see
+ * fm_form_do_events()'s comment on that). Without fixed-width padding,
+ * placing a short name over "<empty>" (or a longer name) left stray
+ * glyphs from the old text showing through around the new one -- always
+ * padding out to the row's own full FA_CONTENT_CHARS width, right-padded
+ * with spaces via "%-Ns.Ns", guarantees every redraw fully overwrites
+ * whatever was there before, regardless of old vs. new length.
+ *
+ * Also (re)marks which of the four tab buttons is the active page,
+ * SELECTED (drawn inverted, like a pressed button -- the same STATE bit
+ * FA_ROW/FM_ROW use for their own highlight, it applies to G_BUTTON just
+ * as well regardless of that object also being EXIT|TOUCHEXIT) so the
+ * active tab stays visibly marked rather than only flashing during its
+ * own click. Called on every page-content change (initial open, tab
+ * switch, return from Browser), so this always stays in sync with
+ * fa_current_page without a separate call site of its own. */
+static void fa_refresh_rows(void)
+{
+    int i;
+    int base = fa_current_page * FA_ROWS; /* slot NUMBERING must follow the active tab -- page 1 (16-30) shows 16..30, not 01..15 again */
+
+    for (i = 0; i < FA_ROWS; i++) {
+        int slot = base + i;
+        const char *name = fa_slots[slot][0] != '\0' ? fa_slots[slot] : "<empty>";
+        sprintf(fa_row_text[i], "%02d  %-*.*s", slot + 1,
+                FA_CONTENT_CHARS - 4, FA_CONTENT_CHARS - 4, name);
+        fa_dlg[FA_ROW(i)].ob_state &= (unsigned short)(~SELECTED);
+    }
+    fa_selected_row = -1; /* whatever was selected belonged to the old content/page -- same reset fm_apply_entries_to_rows() does */
+
+    for (i = 0; i < FA_TAB_COUNT; i++) {
+        if (i == fa_current_page)
+            fa_dlg[FA_TAB(i)].ob_state |= (unsigned short)SELECTED;
+        else
+            fa_dlg[FA_TAB(i)].ob_state &= (unsigned short)(~SELECTED);
+    }
+}
+
+/* PLACE MODE and MOVE MODE share the same FLAT_HAND hover cursor and
+ * "click a row to act" flow (see dialog_run()'s own MU_M1/MU_BUTTON
+ * handling below) -- they only differ in the source of the name being
+ * placed: a browser filename (fa_place_name) for PLACE, an existing
+ * favorite slot (fa_move_source_slot) for MOVE. */
+typedef enum {
+    FAVORITES_MODE_NORMAL = 0,
+    FAVORITES_MODE_PLACE,
+    FAVORITES_MODE_MOVE
+} FavoritesMode;
+static FavoritesMode fa_mode;
+static char fa_place_name[FLOPPY_BROWSE_NAME_LEN]; /* the browser filename waiting to be placed -- valid only while fa_mode == FAVORITES_MODE_PLACE */
+static int fa_move_source_slot = -1; /* absolute slot (0..FA_TOTAL_SLOTS-1) being moved -- valid only while fa_mode == FAVORITES_MODE_MOVE */
+
+/* Maps an absolute screen point to a favorite ROW index (0..FA_ROWS-1) on
+ * the CURRENTLY displayed page, or -1 if outside every row. Same
+ * root-is-absolute-after-dialog_open()/children-are-relative technique
+ * fm_row_near() already relies on for the main browser's own rows. The
+ * caller adds fa_current_page*FA_ROWS to get the absolute favorite number
+ * (1..60) -- see this task's own "IMPORTANT: CURRENT SERVER / PAGE"
+ * requirement. */
+static int fa_row_at(short mx, short my)
+{
+    int i;
+    short root_x = fa_dlg[FA_ROOT].ob_x;
+    short root_y = fa_dlg[FA_ROOT].ob_y;
+
+    for (i = 0; i < FA_ROWS; i++) {
+        OBJECT *row = &fa_dlg[FA_ROW(i)];
+        short x = (short)(root_x + row->ob_x);
+        short y = (short)(root_y + row->ob_y);
+
+        if (mx < x || mx >= x + row->ob_width)
+            continue;
+        if (my < y || my >= y + row->ob_height)
+            continue;
+        return i;
+    }
+    return -1;
+}
+
+/* Redraws ONE row without repainting the other 14 (unlike a tab switch,
+ * where every row's content changes anyway) -- placing a favorite only
+ * ever changes the one row that was clicked. G_STRING objects paint text
+ * ink only, in transparent mode, never a background (see fa_refresh_rows()'s
+ * own comment) -- so unlike redrawing FA_ROOT (whose G_BOX fill repaints
+ * white for every child), a single row needs its own small rectangle
+ * erased first via a plain VDI v_bar(), then just that row's objc_draw()
+ * on top. graf_handle()'s return value (ignored everywhere else in this
+ * file, which only ever needs its cw/ch/bw/bh OUT params) is the VDI
+ * workstation handle AES itself already uses -- reused here rather than
+ * opening a second one, and left with no cleanup/restore afterward since
+ * every AES draw call (including the objc_draw() below) sets up whatever
+ * VDI text/fill attributes IT needs itself rather than trusting leftover
+ * state, the same assumption this codebase already relies on implicitly
+ * everywhere else. */
+static void fa_redraw_row(int row)
+{
+    short cw, ch, bw, bh;
+    short handle;
+    short pxy[4];
+    OBJECT *ro = &fa_dlg[FA_ROW(row)];
+    short x = (short)(fa_dlg[FA_ROOT].ob_x + ro->ob_x);
+    short y = (short)(fa_dlg[FA_ROOT].ob_y + ro->ob_y);
+
+    handle = graf_handle(&cw, &ch, &bw, &bh);
+
+    pxy[0] = x;
+    pxy[1] = y;
+    pxy[2] = (short)(x + ro->ob_width - 1);
+    pxy[3] = (short)(y + ro->ob_height - 1);
+
+    vswr_mode(handle, MD_REPLACE);
+    vsf_interior(handle, FIS_SOLID);
+    vsf_color(handle, WHITE);
+    v_bar(handle, pxy);
+
+    objc_draw(fa_dlg, FA_ROW(row), MAX_DEPTH, x, y, ro->ob_width, ro->ob_height);
+}
+
+/* Shows a "Now starting <name>" stub alert for the currently selected
+ * favorite -- same stub fm_start_selected() used to show in the browser
+ * before Step 4 replaced it with opening this dialog; still no real
+ * mount/emulation behind it. Shared by a double-click on a row and
+ * Return/Enter (dialog_run()'s own MU_KEYBD handling below), same "two
+ * ways to confirm a selection" idea fm_form_do_events() already
+ * established for the browser. No-op if nothing is selected, or the
+ * selected slot is empty -- there is nothing to start either way. */
+static void fa_start_selected(void)
+{
+    int slot;
+    char msg[300];
+
+    if (fa_selected_row < 0)
+        return;
+    slot = fa_current_page * FA_ROWS + fa_selected_row;
+    if (fa_slots[slot][0] == '\0')
+        return;
+    sprintf(msg, "[1][Now starting:|%-.60s][OK]", fa_slots[slot]);
+    form_alert(1, msg);
+}
+
+/* Empties the currently selected favorite slot -- "Erase", not "Delete":
+ * nothing is thrown away, a slot just becomes free again, so no
+ * confirmation prompt either (per this task's own brief). Shared by
+ * [Erase] (FA_ERASE_BTN) and the keyboard Delete key (dialog_run()'s own
+ * MU_KEYBD handling below). No-op if nothing is selected -- there is
+ * nothing to erase either way; an already-empty slot erases to the same
+ * empty state harmlessly if somehow selected. */
+static void fa_erase_selected(void)
+{
+    int slot, row;
+
+    if (fa_selected_row < 0)
+        return;
+    row = fa_selected_row;
+    slot = fa_current_page * FA_ROWS + row;
+    fa_slots[slot][0] = '\0';
+    fa_refresh_rows();
+    fa_redraw_row(row); /* only this one row changed -- same reasoning as the PLACE MODE placement code */
+}
+
+/* Arms MOVE MODE for the currently selected favorite -- shared by [Move]
+ * (FA_MOVE_BTN, dialog_run()'s own MU_BUTTON handling) and the M key
+ * (dialog_run()'s own MU_KEYBD handling), NORMAL MODE only for the key
+ * (see that call site's own comment). No-op (returns hand_shown
+ * unchanged) if nothing is selected. Returns the new hand_shown value --
+ * the caller must assign it to its own local, since the ongoing MU_M1
+ * hover watch in dialog_run()'s main loop depends on it (this function
+ * cannot update a caller's local by itself). row_x/y/w/h are recomputed
+ * here rather than passed in: cheap (a handful of integer ops against
+ * FA_ROOT/FA_ROW(0)'s own already-set geometry, same values dialog_run()
+ * itself computes once at startup and never changes), and keeps this
+ * function's own signature to just the one value that genuinely differs
+ * per call. */
+static int fa_arm_move(int hand_shown)
+{
+    int row;
+    short mx, my, mb, ks;
+    short row_x, row_y, row_w, row_h;
+
+    if (fa_selected_row < 0)
+        return hand_shown;
+
+    row = fa_selected_row;
+    fa_move_source_slot = fa_current_page * FA_ROWS + row;
+    fa_mode = FAVORITES_MODE_MOVE;
+
+    /* MOVE MODE has no "selected row" concept, only a pending source slot
+     * -- clear the row's own highlight, same as PLACE MODE never leaves a
+     * row selected either. */
+    fa_dlg[FA_ROW(row)].ob_state &= (unsigned short)(~SELECTED);
+    fa_selected_row = -1;
+    fa_redraw_row(row);
+
+    row_x = (short)(fa_dlg[FA_ROOT].ob_x + fa_dlg[FA_ROW(0)].ob_x);
+    row_y = (short)(fa_dlg[FA_ROOT].ob_y + fa_dlg[FA_ROW(0)].ob_y);
+    row_w = fa_dlg[FA_ROW(0)].ob_width;
+    row_h = (short)((fa_dlg[FA_ROOT].ob_y + fa_dlg[FA_ROW(FA_ROWS - 1)].ob_y
+                      + fa_dlg[FA_ROW(FA_ROWS - 1)].ob_height) - row_y);
+
+    /* Cursor from the mouse's ACTUAL current position, same reasoning as
+     * FA_BROWSER_BTN's own post-Browser cursor recompute. */
+    graf_mkstate(&mx, &my, &mb, &ks);
+    hand_shown = (mx >= row_x && mx < row_x + row_w && my >= row_y && my < row_y + row_h);
+    graf_mouse(hand_shown ? FLAT_HAND : ARROW, 0L);
+
+    return hand_shown;
+}
+
+/* Switches to page (0..FA_TAB_COUNT-1) and redraws -- shared by a tab
+ * click (FA_TAB(page), dialog_run()'s own MU_BUTTON handling) and the
+ * F1-F4 keys (dialog_run()'s own MU_KEYBD handling). Mode-independent
+ * (callable during PLACE/MOVE MODE too, same as the mouse tab click
+ * already was) -- fa_refresh_rows() itself resets any row selection and
+ * re-marks the new active tab SELECTED. */
+static void fa_switch_page(int page)
+{
+    fa_current_page = page;
+    fa_refresh_rows();
+    objc_draw(fa_dlg, FA_ROOT, MAX_DEPTH, fa_dlg[FA_ROOT].ob_x, fa_dlg[FA_ROOT].ob_y,
+              fa_dlg[FA_ROOT].ob_width, fa_dlg[FA_ROOT].ob_height);
+}
+
+/* Deselects the currently selected favorite, if any -- called on Esc
+ * (dialog_run()'s own MU_KEYBD handling below), NORMAL MODE only (see
+ * that call site's own comment on why). Right-click deselection was
+ * tried twice (an undocumented evnt_multi() bclicks bit, then a
+ * documented MU_TIMER + graf_mkstate() poll) and dropped: the first broke
+ * ordinary clicks outright, the second worked but felt unreliable/laggy
+ * in practice -- Esc alone is the current, deliberately simpler design.
+ *
+ * NOT form_button() re-clicked on the same row -- see fm_deselect()'s own
+ * comment for why that never worked (FA_ROW, like FM_ROW, is SELECTABLE |
+ * RBUTTON; EmuTOS's own fm_button() always re-selects an RBUTTON member
+ * that is clicked again, never toggles it off). Clears the bit directly
+ * and uses fa_redraw_row()'s own erase-then-draw instead, exactly like
+ * PLACE MODE placement already does when a row's content changes. */
+static void fa_deselect(void)
+{
+    int row;
+
+    if (fa_selected_row < 0)
+        return;
+    row = fa_selected_row;
+    fa_dlg[FA_ROW(row)].ob_state &= (unsigned short)(~SELECTED);
+    fa_selected_row = -1;
+    fa_redraw_row(row);
+}
+
+/* Computes the FA_TITLE text from cfg's own active profile -- shared by
+ * dialog_run()'s own startup and by its post-Browser refresh (the active
+ * source can change while the nested browser is open, via its own
+ * [Source] button), per this task's own "Favorites - <server nickname>"
+ * requirement. */
+static void fa_update_title(const ProfileConfig *cfg)
+{
+    int have_active = (cfg->active_index >= 0 && cfg->active_index < MAX_PROFILES
+                        && profile_slot_is_configured(&cfg->profiles[cfg->active_index]));
+
+    if (have_active)
+        sprintf(fa_title_text, "Favorites - %-.30s", cfg->profiles[cfg->active_index].nickname);
+    else
+        sprintf(fa_title_text, "Favorites - (no source)");
+}
+
 /* 16, not the LFN browser's own 25-per-page figure (RESEARCH-STEP0.md) --
  * 25 rows plus the title/source/directory lines and buttons made the main
  * window taller than a real 640x200 medium-resolution screen (~223px
@@ -1379,8 +1902,8 @@ enum {
 #define FM_DIV3          (FM_AFTER_ROWS + 0)
 #define FM_SOURCE_BTN    (FM_AFTER_ROWS + 1)
 #define FM_DIRUP_BTN     (FM_AFTER_ROWS + 2)
-#define FM_START_BTN     (FM_AFTER_ROWS + 3)
-#define FM_QUIT_BTN      (FM_AFTER_ROWS + 4)
+#define FM_ADD_BTN (FM_AFTER_ROWS + 3)
+#define FM_BACK_BTN      (FM_AFTER_ROWS + 4) /* cancel back to Favorites -- see fm_browse_run()'s own comment. The program's actual Quit lives on Favorites now (FA_QUIT_BTN). */
 /* Placeholder for pagination -- buttons only for now, no paging logic
  * wired in yet: GET_PAGE already supports an arbitrary page_index on the
  * protocol/firmware side (one combined dirs-then-files page per call, see
@@ -1549,11 +2072,11 @@ static void fm_dialog_init(void)
     set_obj(fm_dlg, FM_DIRUP_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 15*lm.cw, ybtn, 13*lm.cw, lm.rh);
     fm_dlg[FM_DIRUP_BTN].ob_spec.free_string = "   Dir Up   ";
 
-    set_obj(fm_dlg, FM_START_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 29*lm.cw, ybtn, 9*lm.cw, lm.rh);
-    fm_dlg[FM_START_BTN].ob_spec.free_string = "  Start  ";
+    set_obj(fm_dlg, FM_ADD_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 29*lm.cw, ybtn, 9*lm.cw, lm.rh);
+    fm_dlg[FM_ADD_BTN].ob_spec.free_string = "   Add   ";
 
-    set_obj(fm_dlg, FM_QUIT_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 39*lm.cw, ybtn, 8*lm.cw, lm.rh);
-    fm_dlg[FM_QUIT_BTN].ob_spec.free_string = " Quit  ";
+    set_obj(fm_dlg, FM_BACK_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 39*lm.cw, ybtn, 8*lm.cw, lm.rh);
+    fm_dlg[FM_BACK_BTN].ob_spec.free_string = " Back  ";
 
     /* Far right, reserved for pagination (Step 3+) -- no paging logic
      * behind these yet, see FM_PREV_BTN/FM_NEXT_BTN's own comment.
@@ -1658,29 +2181,21 @@ static void fm_refresh(ProfileConfig *cfg)
     fm_apply_entries_to_rows();
 }
 
-/* STEP 1.x STUB -- there is no floppy mount/emulation yet (explicitly out
- * of scope, see RESEARCH-STEP0.md). Builds the full source+directory+
- * filename path (no GEMDOS 8.3 shortening -- these are plain C strings,
- * never touched by GEMDOS) and reports what would be started. Deliberately
- * kept to exactly the inputs a real "send the selection to the Pico"
- * command will need (source/backend + directory + filename), so wiring up
- * the real command later should not require changing this function's
- * shape, only its body. */
-static void fm_start_selected(const ProfileConfig *cfg)
+/* Fills out_name with the browser's currently selected FILE name (never a
+ * directory -- a folder is never a placeable favorite), or leaves it
+ * empty if nothing valid is selected. Shared by every way of "confirming"
+ * a selection inside fm_browse_run() below: double-click, Return/Enter
+ * (fm_form_do_events()'s own is_double/keyboard handling), and the
+ * [Add] button (FM_ADD_BTN's own case). A directory row
+ * double-click never reaches this at all -- it navigates into the
+ * directory instead. */
+static void fm_capture_selection(char *out_name, int out_name_cap)
 {
-    const Profile *p;
-    char msg[400];
-
-    if (fm_selected_row < 0 || fm_selected_row >= fm_entry_count)
-        return; /* Start with no selection: do nothing, matches the task brief */
-    if (fm_entries[fm_selected_row].is_dir)
-        return; /* a directory row is navigated (see dialog_run()'s double-click handling), never "started" */
-
-    p = &cfg->profiles[cfg->active_index];
-
-    sprintf(msg, "[1][Would start:|%-.20s (%s)|%-.60s/|%-.30s][OK]",
-            p->nickname, profile_backend_word(p), fm_cwd, fm_entries[fm_selected_row].name);
-    form_alert(1, msg);
+    if (fm_selected_row >= 0 && fm_selected_row < fm_entry_count
+        && !fm_entries[fm_selected_row].is_dir)
+        set_buf(out_name, out_name_cap, fm_entries[fm_selected_row].name);
+    else
+        out_name[0] = '\0';
 }
 
 /* objc_find() only matches a click that lands exactly inside a row's own
@@ -1714,6 +2229,65 @@ static int fm_row_near(short mx, short my)
             return i;
     }
     return -1;
+}
+
+/* Erases just row's own rectangle (v_bar, white) before redrawing its
+ * G_STRING -- same technique and same reason as fa_redraw_row() (see that
+ * function's own comment): G_STRING objects paint text ink only, in
+ * transparent mode, never a background, so a plain objc_draw() alone
+ * cannot clear a stale SELECTED highlight (or old text) by itself. */
+static void fm_redraw_row(int row)
+{
+    short cw, ch, bw, bh;
+    short handle;
+    short pxy[4];
+    OBJECT *ro = &fm_dlg[FM_ROW(row)];
+    short x = (short)(fm_dlg[FM_ROOT].ob_x + ro->ob_x);
+    short y = (short)(fm_dlg[FM_ROOT].ob_y + ro->ob_y);
+
+    handle = graf_handle(&cw, &ch, &bw, &bh);
+
+    pxy[0] = x;
+    pxy[1] = y;
+    pxy[2] = (short)(x + ro->ob_width - 1);
+    pxy[3] = (short)(y + ro->ob_height - 1);
+
+    vswr_mode(handle, MD_REPLACE);
+    vsf_interior(handle, FIS_SOLID);
+    vsf_color(handle, WHITE);
+    v_bar(handle, pxy);
+
+    objc_draw(fm_dlg, FM_ROW(row), MAX_DEPTH, x, y, ro->ob_width, ro->ob_height);
+}
+
+/* Deselects the currently selected browser row, if any -- called on Esc
+ * (fm_form_do_events()'s own MU_KEYBD handling below). Right-click
+ * deselection was tried and dropped -- see fa_deselect()'s own comment.
+ *
+ * NOT form_button() re-clicked on the same row: FM_ROW is SELECTABLE |
+ * RBUTTON, and EmuTOS's own fm_button() (the real implementation of
+ * form_button(), aes/gemfmlib.c) shows the RBUTTON branch always
+ * unconditionally re-ORs SELECTED onto the clicked object
+ * (`tstate |= SELECTED`) and only clears OTHER siblings -- it never
+ * XORs/toggles the clicked object itself off. That XOR-toggle only
+ * happens in the plain-SELECTABLE (non-RBUTTON) branch. So calling
+ * form_button() again on an already-selected RBUTTON member (as this
+ * function first tried) just re-confirms it selected -- it can never
+ * turn it off. This is why an earlier version of this function appeared
+ * to do nothing at all when tested. The correct fix: clear the bit
+ * directly and use fm_redraw_row()'s erase-then-draw, same technique
+ * PLACE MODE placement already relies on for FA_ROW, since G_STRING has
+ * no fill of its own to clear a highlight (or old text) any other way. */
+static void fm_deselect(void)
+{
+    int row;
+
+    if (fm_selected_row < 0)
+        return;
+    row = fm_selected_row;
+    fm_dlg[FM_ROW(row)].ob_state &= (unsigned short)(~SELECTED);
+    fm_selected_row = -1;
+    fm_redraw_row(row);
 }
 
 /* Custom event loop instead of form_do(): needed for two things form_do()
@@ -1795,17 +2369,68 @@ static short fm_form_do_events(int *out_double)
                     fm_selected_row = new_row;
                 }
                 /* result stays -1: handled here, keep looping */
-            } else if (visible_count > 0 && (kr & 0x00FF) == 0x0D
-                       && fm_selected_row >= 0 && fm_selected_row < visible_count) {
-                /* Return/Enter on a selected row: same outcome as a
-                 * double-click on it (open the directory, or start the
-                 * file) -- reuses dialog_run()'s existing is_double
-                 * handling below rather than duplicating navigate/start
-                 * logic here. ASCII 0x0D, not the scan code, since GEM
-                 * already translates both the main Return key and the
-                 * numpad Enter key to the same ASCII value. */
-                result = (short)FM_ROW(fm_selected_row);
-                *out_double = 1;
+            } else if ((kr & 0x00FF) == 0x0D) {
+                /* Return/Enter ALWAYS does something now (Favorites
+                 * task): with a row selected, same outcome as a
+                 * double-click on it (open the directory, or confirm the
+                 * file back to Favorites) -- reuses fm_browse_run()'s
+                 * existing is_double handling there rather than
+                 * duplicating navigate/confirm logic here. With nothing
+                 * selected (or an empty directory), it still confirms
+                 * (with nothing armed) -- FM_ADD_BTN's own dispatch
+                 * in fm_browse_run() already handles that case correctly
+                 * regardless of who "clicked" it, mouse or keyboard.
+                 * ASCII 0x0D, not the scan code, since GEM already
+                 * translates both the main Return key and the numpad
+                 * Enter key to the same ASCII value. */
+                if (visible_count > 0 && fm_selected_row >= 0 && fm_selected_row < visible_count) {
+                    result = (short)FM_ROW(fm_selected_row);
+                    *out_double = 1;
+                } else {
+                    result = (short)FM_ADD_BTN;
+                }
+            } else if (scan == 0x01 || (kr & 0x00FF) == 0x1B) {
+                /* Esc: deselect -- see fm_deselect()'s own comment. Checked
+                 * by BOTH scan code (0x01, standard AT/Atari Escape) and
+                 * ASCII (0x1B): unlike Return/Enter, real hardware/AES was
+                 * not confirmed to reliably report Escape's ASCII byte the
+                 * way the arrow keys report none at all (scan-only) --
+                 * this is defensive until confirmed which one actually
+                 * fires here. */
+                fm_deselect();
+            } else if (scan == 0x0F || (kr & 0x00FF) == 0x09) {
+                /* Tab: same as [Back] -- returns to Favorites with
+                 * nothing armed, same as pressing FM_BACK_BTN itself
+                 * (fm_browse_run()'s own case for it handles this
+                 * uniformly regardless of mouse or keyboard origin, same
+                 * idiom Enter already relies on for FM_ADD_BTN
+                 * above). Scan code (standard AT/Atari Tab) and ASCII
+                 * (0x09) both checked, same dual-check convention Esc
+                 * already established. */
+                result = (short)FM_BACK_BTN;
+            } else if (scan == 0x4B) {
+                /* Left arrow: same as [Prev] -- fm_browse_run()'s own
+                 * case for it already checks fm_has_prev, so this is a
+                 * harmless no-op when there is no previous page, same as
+                 * the button itself being DISABLED then. */
+                result = (short)FM_PREV_BTN;
+            } else if (scan == 0x4D) {
+                /* Right arrow: same as [Next] -- see the Left-arrow
+                 * comment just above, mirrored for fm_has_next. */
+                result = (short)FM_NEXT_BTN;
+            } else if (scan == 0x1F) {
+                /* S: same as [Source]. Scan code, standard AT/Atari S. */
+                result = (short)FM_SOURCE_BTN;
+            } else if (scan == 0x0E || (kr & 0x00FF) == 0x08) {
+                /* Backspace: same as [Dir Up]. Scan code (standard AT/
+                 * Atari Backspace) and ASCII (0x08) both checked, same
+                 * dual-check convention Esc/Tab already established. */
+                result = (short)FM_DIRUP_BTN;
+            } else if (scan == 0x61) {
+                /* Undo: same as [Back] -- same scan code Favorites' own
+                 * Undo-means-Quit uses, reused here for its own [Back]
+                 * equivalent. */
+                result = (short)FM_BACK_BTN;
             }
         }
     }
@@ -1813,25 +2438,28 @@ static short fm_form_do_events(int *out_double)
     return result;
 }
 
-void dialog_run(ProfileConfig *cfg)
+/* Runs the file browser as a NESTED dialog (Favorites, dialog_run() below,
+ * is the app's own top-level screen now -- see this file's own comment on
+ * FA_QUIT_BTN/FA_BROWSER_BTN). Returns 1 if the user confirmed a file
+ * (double-click, Return/Enter, or [Favorites] -- see fm_capture_selection())
+ * -- out_name holds its name, out_name_cap bytes -- or 0 if they pressed
+ * [Back] (or confirmed with nothing/a directory selected), in which case
+ * out_name is left empty. Either way, control always returns to the
+ * caller; this function never talks to the Favorites dialog directly. */
+static int fm_browse_run(ProfileConfig *cfg, char *out_name, int out_name_cap)
 {
     DialogGeometry geo;
     short which;
-    int done;
+    int done, confirmed;
     int is_double;
     int selector_result;
-
-    shared_fields_init();
-
-    pw_dialog_show();
-    startup_load(cfg);
-    pw_dialog_hide();
 
     fm_dialog_init();
     fm_refresh(cfg);
     dialog_open(fm_dlg, FM_ROOT, &geo, fm_short_screen);
 
     done = 0;
+    confirmed = 0;
     while (!done) {
         which = fm_form_do_events(&is_double);
 
@@ -1867,7 +2495,12 @@ void dialog_run(ProfileConfig *cfg)
                     objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
                     graf_mouse(ARROW, 0L);
                 } else {
-                    fm_start_selected(cfg);
+                    /* A file: confirm and return to the caller (Favorites,
+                     * see dialog_run() below), same outcome as the
+                     * [Add] button. */
+                    fm_capture_selection(out_name, out_name_cap);
+                    confirmed = 1;
+                    done = 1;
                 }
             }
             continue;
@@ -1917,11 +2550,12 @@ void dialog_run(ProfileConfig *cfg)
             }
             break;
 
-        case FM_START_BTN:
-            if (fm_selected_row < 0)
-                form_alert(1, "[3][No image selected.][OK]");
-            else
-                fm_start_selected(cfg);
+        case FM_ADD_BTN:
+            /* Confirm and return, selection or not -- see
+             * fm_capture_selection()'s own comment. */
+            fm_capture_selection(out_name, out_name_cap);
+            confirmed = 1;
+            done = 1;
             break;
 
         case FM_PREV_BTN:
@@ -1950,10 +2584,332 @@ void dialog_run(ProfileConfig *cfg)
             }
             break;
 
-        case FM_QUIT_BTN:
+        case FM_BACK_BTN:
         default:
+            /* Deliberate cancel: always returns with nothing armed, even
+             * if a row happens to be selected -- distinct from
+             * [Favorites]/double-click/Enter, which confirm the current
+             * selection (or lack of one). */
+            out_name[0] = '\0';
+            confirmed = 0;
             done = 1;
             break;
+        }
+    }
+
+    dialog_close(&geo);
+    return confirmed;
+}
+
+/* Opens the nested browser (fm_browse_run()) and processes its result --
+ * shared by [Browser] (FA_BROWSER_BTN, dialog_run()'s own MU_BUTTON
+ * handling) and Tab (dialog_run()'s own MU_KEYBD handling). Returns the
+ * new hand_shown value -- see fa_arm_move()'s own comment for why this
+ * can't just update a caller's local directly. row_x/y/w/h are
+ * recomputed here rather than passed in, same reasoning as
+ * fa_arm_move(). */
+static int fa_open_browser(ProfileConfig *cfg, int hand_shown)
+{
+    char browsed_name[FLOPPY_BROWSE_NAME_LEN];
+    short mx, my, mb, ks;
+    short row_x, row_y, row_w, row_h;
+
+    /* fm_browse_run() draws its own full-window dialog over (on a short
+     * screen, exactly over) this screen's own area -- once it closes,
+     * Favorites itself must be explicitly redrawn. No busy cursor:
+     * fm_browse_run() is itself an interactive dialog, not a Pico round
+     * trip. Also silently cancels a pending MOVE MODE, if one was armed
+     * -- fa_move_source_slot is only ever read while fa_mode ==
+     * FAVORITES_MODE_MOVE, so this reset is defensive tidiness, not a
+     * correctness fix. */
+    fa_move_source_slot = -1;
+    if (fm_browse_run(cfg, browsed_name, (int)sizeof(browsed_name))) {
+        fa_mode = FAVORITES_MODE_PLACE;
+        set_buf(fa_place_name, FLOPPY_BROWSE_NAME_LEN, browsed_name);
+    } else {
+        fa_mode = FAVORITES_MODE_NORMAL;
+        fa_place_name[0] = '\0';
+    }
+    fa_update_title(cfg); /* the source may have changed via the browser's own [Source] button */
+    fa_refresh_rows();
+    objc_draw(fa_dlg, FA_ROOT, MAX_DEPTH, fa_dlg[FA_ROOT].ob_x, fa_dlg[FA_ROOT].ob_y,
+              fa_dlg[FA_ROOT].ob_width, fa_dlg[FA_ROOT].ob_height);
+
+    row_x = (short)(fa_dlg[FA_ROOT].ob_x + fa_dlg[FA_ROW(0)].ob_x);
+    row_y = (short)(fa_dlg[FA_ROOT].ob_y + fa_dlg[FA_ROW(0)].ob_y);
+    row_w = fa_dlg[FA_ROW(0)].ob_width;
+    row_h = (short)((fa_dlg[FA_ROOT].ob_y + fa_dlg[FA_ROW(FA_ROWS - 1)].ob_y
+                      + fa_dlg[FA_ROW(FA_ROWS - 1)].ob_height) - row_y);
+
+    /* Cursor state must be recomputed from the mouse's ACTUAL position --
+     * the browser fully owned the screen/cursor while open. */
+    graf_mkstate(&mx, &my, &mb, &ks);
+    hand_shown = (fa_mode == FAVORITES_MODE_PLACE
+                  && mx >= row_x && mx < row_x + row_w
+                  && my >= row_y && my < row_y + row_h);
+    graf_mouse(hand_shown ? FLAT_HAND : ARROW, 0L);
+
+    return hand_shown;
+}
+
+/* The app's own top-level screen (see this file's own Favorites-dialog
+ * section header comment) -- called once from main.c. Opens the browser
+ * (fm_browse_run(), FM_* section above) as a nested dialog on [Browser];
+ * a confirmed file arms PLACE MODE on return, otherwise NORMAL MODE
+ * continues. [Quit] is the only way out, ending the whole program. */
+void dialog_run(ProfileConfig *cfg)
+{
+    DialogGeometry geo;
+    short mx, my, mb, ks, kr, br;
+    short msg[8];
+    short event, obj, next, which;
+    short row_x, row_y, row_w, row_h;
+    int done, hand_shown;
+
+    shared_fields_init();
+
+    pw_dialog_show();
+    startup_load(cfg);
+    pw_dialog_hide();
+
+    fa_slots_seed_once();
+    fa_dialog_init();
+    fa_current_page = 0;
+    fa_update_title(cfg);
+    fa_refresh_rows();
+    dialog_open(fa_dlg, FA_ROOT, &geo, fa_short_screen);
+
+    fa_mode = FAVORITES_MODE_NORMAL; /* nothing browsed yet at program start */
+    fa_place_name[0] = '\0';
+
+    /* Absolute screen rect of the whole row-list area (not per-row -- see
+     * this task's own "FLAT_HAND while the mouse is over the favorite
+     * file/slot area"), for MU_M1's enter/leave watch below. Computed once:
+     * FA_ROOT's own ob_x/ob_y (and every row's relative ob_x/ob_y) never
+     * change again after dialog_open() above, regardless of how many times
+     * the nested browser is opened and closed below. */
+    row_x = (short)(fa_dlg[FA_ROOT].ob_x + fa_dlg[FA_ROW(0)].ob_x);
+    row_y = (short)(fa_dlg[FA_ROOT].ob_y + fa_dlg[FA_ROW(0)].ob_y);
+    row_w = fa_dlg[FA_ROW(0)].ob_width;
+    row_h = (short)((fa_dlg[FA_ROOT].ob_y + fa_dlg[FA_ROW(FA_ROWS - 1)].ob_y
+                      + fa_dlg[FA_ROW(FA_ROWS - 1)].ob_height) - row_y);
+
+    hand_shown = 0;
+    graf_mouse(ARROW, 0L);
+
+    done = 0;
+    while (!done) {
+        short flags = (short)(MU_KEYBD | MU_BUTTON);
+        short m1leave = 0;
+
+        /* FLAT_HAND hover is shared by PLACE and MOVE MODE -- see
+         * FavoritesMode's own comment. */
+        if (fa_mode == FAVORITES_MODE_PLACE || fa_mode == FAVORITES_MODE_MOVE) {
+            flags = (short)(flags | MU_M1);
+            m1leave = hand_shown ? 1 : 0;
+        }
+
+        event = evnt_multi(flags,
+                           2, 1, 1,
+                           m1leave, row_x, row_y, row_w, row_h,
+                           0, 0, 0, 0, 0,
+                           msg,
+                           0UL,
+                           &mx, &my, &mb, &ks, &kr, &br);
+
+        if ((event & MU_M1) && (fa_mode == FAVORITES_MODE_PLACE || fa_mode == FAVORITES_MODE_MOVE)) {
+            hand_shown = !hand_shown;
+            graf_mouse(hand_shown ? FLAT_HAND : ARROW, 0L);
+        }
+
+        if (event & MU_BUTTON) {
+            int placed = 0;
+
+            if (fa_mode == FAVORITES_MODE_PLACE) {
+                int row = fa_row_at(mx, my);
+                if (row >= 0) {
+                    int slot = fa_current_page * FA_ROWS + row;
+
+                    set_buf(fa_slots[slot], FLOPPY_BROWSE_NAME_LEN, fa_place_name);
+                    fa_refresh_rows();
+                    fa_redraw_row(row); /* only this one row changed -- see fa_redraw_row()'s own comment on why a plain objc_draw() of just the row isn't enough by itself */
+
+                    /* Leave PLACE MODE, restore ARROW, keep the dialog
+                     * open with the new filename visible -- exactly this
+                     * task's own "AFTER PLACEMENT" contract. Replacing an
+                     * already-occupied slot needs no extra confirmation
+                     * step, also per this task's own brief. */
+                    fa_mode = FAVORITES_MODE_NORMAL;
+                    fa_place_name[0] = '\0';
+                    graf_mouse(ARROW, 0L);
+                    placed = 1;
+                }
+            } else if (fa_mode == FAVORITES_MODE_MOVE) {
+                int row = fa_row_at(mx, my);
+                if (row >= 0) {
+                    int dest_slot = fa_current_page * FA_ROWS + row;
+
+                    /* Same slot clicked again: a no-op move, but still
+                     * ends MOVE MODE -- clicking any row always completes
+                     * the gesture one way or another, same as PLACE MODE. */
+                    if (dest_slot != fa_move_source_slot) {
+                        int source_page = fa_move_source_slot / FA_ROWS;
+                        int source_row = fa_move_source_slot % FA_ROWS;
+
+                        set_buf(fa_slots[dest_slot], FLOPPY_BROWSE_NAME_LEN, fa_slots[fa_move_source_slot]);
+                        fa_slots[fa_move_source_slot][0] = '\0';
+
+                        fa_refresh_rows(); /* current page only -- rebuilds fa_row_text[]/tab highlight from fa_slots[] */
+                        fa_redraw_row(row); /* destination -- always on the current page */
+                        if (source_page == fa_current_page)
+                            fa_redraw_row(source_row); /* source also visible on this same page -- redraw it too */
+                    }
+
+                    fa_mode = FAVORITES_MODE_NORMAL;
+                    fa_move_source_slot = -1;
+                    graf_mouse(ARROW, 0L);
+                    placed = 1;
+                }
+            }
+
+            if (!placed) {
+                obj = objc_find(fa_dlg, FA_ROOT, MAX_DEPTH, mx, my);
+                if (obj > 0) {
+                    next = obj;
+                    if (!form_button(fa_dlg, obj, br, &next)) {
+                        which = (short)(next & 0x7FFF);
+                        if (which > 0 && which < FA_NOBJS)
+                            fa_dlg[which].ob_state &= (unsigned short)(~SELECTED);
+                        if (which >= FA_TAB_BASE && which < FA_AFTER_TABS) {
+                            fa_switch_page(which - FA_TAB_BASE);
+                        } else if (which == FA_BROWSER_BTN) {
+                            hand_shown = fa_open_browser(cfg, hand_shown);
+                        } else if (which == FA_MOVE_BTN) {
+                            /* See fa_arm_move()'s own comment -- no-op if
+                             * nothing is selected. FLAT_HAND then shows
+                             * over the row list (MU_M1 above), same as
+                             * PLACE MODE, until a destination row is
+                             * clicked. */
+                            hand_shown = fa_arm_move(hand_shown);
+                        } else if (which == FA_ERASE_BTN) {
+                            fa_erase_selected();
+                        } else if (which == FA_START_BTN) {
+                            /* Same outcome as double-click/Enter on the
+                             * selected favorite -- see fa_start_selected()'s
+                             * own comment. */
+                            fa_start_selected();
+                        } else if (which == FA_QUIT_BTN) {
+                            done = 1;
+                        }
+                    } else if (obj >= FA_ROW_BASE && obj < FA_AFTER_ROWS) {
+                        /* SELECTABLE|RBUTTON, not EXIT -- form_button()
+                         * already toggled the highlight (and cleared
+                         * whichever row was selected before, being an
+                         * RBUTTON family) and redrew just those objects
+                         * itself, same as FM_ROW's own click handling
+                         * (dialog_run()'s own comment there explains why
+                         * no extra objc_draw() belongs here). A double-
+                         * click (br>=2) shows the same stub alert
+                         * Return/Enter does below -- see
+                         * fa_start_selected()'s own comment. */
+                        fa_selected_row = obj - FA_ROW_BASE;
+                        if (br >= 2)
+                            fa_start_selected();
+                    }
+                }
+            }
+        }
+
+        if (event & MU_KEYBD) {
+            int scan = (kr >> 8) & 0x00FF;
+
+            /* Mode-independent shortcuts first -- these match what the
+             * mouse can already do regardless of PLACE/MOVE MODE (Quit
+             * and the tab buttons are reachable by mouse in any mode
+             * today; Browser already cancels a pending PLACE/MOVE, see
+             * fa_open_browser()'s own comment). Checked before the
+             * NORMAL-MODE-only row-selection shortcuts below so
+             * Ctrl+Del's own branch always wins over plain Delete's --
+             * without that ordering, holding Ctrl while pressing Delete
+             * would fire BOTH. */
+            if (scan == 0x61) {
+                /* Undo: same as [Quit] -- standard Atari ST scan code. */
+                done = 1;
+            } else if (scan == 0x0F || (kr & 0x00FF) == 0x09) {
+                /* Tab: same as [Browser] -- scan code (standard AT/Atari
+                 * Tab) and ASCII (0x09) both checked, same dual-check
+                 * convention Esc already established. */
+                hand_shown = fa_open_browser(cfg, hand_shown);
+            } else if (scan == 0x3B) {
+                fa_switch_page(0); /* F1 -> 01-15 */
+            } else if (scan == 0x3C) {
+                fa_switch_page(1); /* F2 -> 16-30 */
+            } else if (scan == 0x3D) {
+                fa_switch_page(2); /* F3 -> 31-45 */
+            } else if (scan == 0x3E) {
+                fa_switch_page(3); /* F4 -> 46-60 */
+            } else if (scan == 0x53 && (ks & K_CTRL)) {
+                /* Ctrl+Del: erase every slot on every page, with
+                 * confirmation (unlike plain Erase/Delete, which never
+                 * asks -- this one is irreversible across the WHOLE
+                 * favorites list, not just one slot). Cancel is the
+                 * default button (form_alert()'s own first argument) so
+                 * an accidental Return/click doesn't wipe everything. */
+                if (form_alert(2, "[3][Erase all 60 slots?][Erase|Cancel]") == 1) {
+                    int i;
+                    for (i = 0; i < FA_TOTAL_SLOTS; i++)
+                        fa_slots[i][0] = '\0';
+                    fa_refresh_rows();
+                    objc_draw(fa_dlg, FA_ROOT, MAX_DEPTH, fa_dlg[FA_ROOT].ob_x, fa_dlg[FA_ROOT].ob_y,
+                              fa_dlg[FA_ROOT].ob_width, fa_dlg[FA_ROOT].ob_height);
+                }
+            } else if (fa_mode == FAVORITES_MODE_NORMAL) {
+                /* Row-selection-dependent shortcuts, NORMAL MODE only --
+                 * in PLACE/MOVE MODE there is no selection concept, only
+                 * a pending action waiting for a row click. */
+                if (scan == 0x48 || scan == 0x50) { /* up / down */
+                    int new_row = fa_selected_row;
+
+                    if (scan == 0x48) /* up */
+                        new_row = (new_row <= 0) ? 0 : new_row - 1;
+                    else /* down */
+                        new_row = (new_row < 0) ? 0 : ((new_row + 1 >= FA_ROWS) ? FA_ROWS - 1 : new_row + 1);
+
+                    /* Let form_button() do the highlight toggle -- same
+                     * call the mouse-click path relies on, see
+                     * fm_form_do_events()'s own comment on why. */
+                    if (new_row != fa_selected_row) {
+                        short next = (short)FA_ROW(new_row);
+                        form_button(fa_dlg, FA_ROW(new_row), 1, &next);
+                        fa_selected_row = new_row;
+                    }
+                } else if ((kr & 0x00FF) == 0x0D) {
+                    /* Return/Enter on a selected favorite: same outcome as
+                     * a double-click on it -- see fa_start_selected()'s
+                     * own comment. ASCII 0x0D, not the scan code, same
+                     * reasoning fm_form_do_events()'s own Enter handling
+                     * already uses. */
+                    fa_start_selected();
+                } else if (scan == 0x53) {
+                    /* Plain Delete key (Ctrl+Del already handled above):
+                     * same outcome as clicking [Erase] -- see
+                     * fa_erase_selected()'s own comment. */
+                    fa_erase_selected();
+                } else if (scan == 0x32) {
+                    /* M key: same outcome as clicking [Move] -- see
+                     * fa_arm_move()'s own comment. Scan code (standard
+                     * AT/Atari code for M), not ASCII, same reasoning
+                     * Esc's own dual check below settled on -- avoids
+                     * depending on Shift state (M vs m) entirely. */
+                    hand_shown = fa_arm_move(hand_shown);
+                } else if (scan == 0x01 || (kr & 0x00FF) == 0x1B) {
+                    /* Esc: deselect -- see fa_deselect()'s own comment.
+                     * Checked by BOTH scan code (0x01) and ASCII (0x1B)
+                     * -- see fm_form_do_events()'s own comment on this
+                     * same check. */
+                    fa_deselect();
+                }
+            }
         }
     }
 
