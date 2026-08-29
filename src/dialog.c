@@ -38,6 +38,7 @@
 #include "dialog.h"
 #include "profile.h"
 #include "floppy_probe.h"
+#include "favcfg.h"
 
 /* ================================================================== */
 /* Shared generic helpers                                              */
@@ -948,8 +949,10 @@ static int fp_editor_run(ProfileConfig *cfg, int index)
 
     if (done == 2) {
         memset(&cfg->profiles[index], 0, sizeof(cfg->profiles[index])); /* state == PROFILE_SLOT_EMPTY */
-        if (cfg->active_index == index)
+        if (cfg->active_index == index) {
             cfg->active_index = 0;
+            favcfg_write_active_slot(1); /* the remembered slot just got deleted -- don't leave it pointing at a stale slot */
+        }
         return 2;
     }
     if (done == 1) return 1;
@@ -1202,6 +1205,7 @@ static int server_selector_run(ProfileConfig *cfg)
             int slot = which - FS_ROW_BASE;
             if (profile_slot_is_configured(&cfg->profiles[slot])) {
                 cfg->active_index = slot;
+                favcfg_write_active_slot(slot + 1); /* remembered independently of the firmware's own flash-only active-profile write, see favcfg_write_active_slot()'s own comment */
                 result = 1;
                 break;
             }
@@ -1251,18 +1255,22 @@ static int server_selector_run(ProfileConfig *cfg)
 /* apart. PLACE MODE: opened already-armed with the browser's selected     */
 /* filename (fa_place_name), FLAT_HAND shown while the mouse is over the   */
 /* row list (MU_M1 enter/leave watch), and a row click stores the filename */
-/* into that favorite slot (fa_slots[]), redraws it, and returns to        */
-/* normal. Erase empties the selected slot, no confirmation (see           */
-/* fa_erase_selected()), same as the keyboard Delete key. Move arms MOVE   */
-/* MODE for the selected favorite -- same FLAT_HAND/row-click flow as      */
-/* PLACE MODE, just moving an existing favorite (fa_move_source_slot)      */
-/* instead of a browser filename, clearing the source slot once the        */
-/* destination row is clicked. Start shows the same "Now starting <name>"  */
+/* into that favorite slot (persisted to disk, see src/favcfg.c), redraws  */
+/* it, and returns to normal. Erase empties the selected slot, no          */
+/* confirmation (see fa_erase_selected()), same as the keyboard Delete     */
+/* key. Move arms MOVE MODE for the selected favorite -- same FLAT_HAND/   */
+/* row-click flow as PLACE MODE, just swapping an existing favorite        */
+/* (fa_move_source_slot) with the destination instead of placing a browser */
+/* filename. Start shows the same "Now starting <name>"                    */
 /* stub as double-click/Enter on the selected favorite (fa_start_selected()) */
 /* -- same "several ways to confirm" idiom the browser's own [Add]/        */
 /* double-click/Enter already use. Browser opens the nested browser (see   */
-/* above); Quit is the only button that actually ends this loop, exiting   */
-/* the whole program (dialog_run() returning to main.c's own appl_exit()). */
+/* above); Source opens the server/source selector (fa_open_source()) --   */
+/* this used to be the browser's own button, moved here since which mount  */
+/* is active determines which favorites are shown just as much as which    */
+/* files the browser lists. Quit is the only button that actually ends     */
+/* this loop, exiting the whole program (dialog_run() returning to         */
+/* main.c's own appl_exit()).                                              */
 /* ================================================================== */
 enum {
     FA_ROOT = 0,
@@ -1284,22 +1292,28 @@ enum {
 #define FA_ROW(i)      (FA_ROW_BASE + (i))
 #define FA_AFTER_ROWS  (FA_ROW_BASE + FA_ROWS)
 #define FA_DIV3        (FA_AFTER_ROWS + 0)
-#define FA_MOVE_BTN    (FA_AFTER_ROWS + 1)
-#define FA_ERASE_BTN   (FA_AFTER_ROWS + 2) /* empties the selected slot -- "Erase", not "Delete": nothing is thrown away, a slot just becomes free again */
-#define FA_START_BTN   (FA_AFTER_ROWS + 3)
-#define FA_BROWSER_BTN (FA_AFTER_ROWS + 4)
+/* Leftmost, same position [Source] used to have in the browser -- moved
+ * here per this task's own request (the browser's own former
+ * FM_SOURCE_BTN). Move/Erase/Start/Browser shifted right to make room. */
+#define FA_SOURCE_BTN  (FA_AFTER_ROWS + 1)
+#define FA_MOVE_BTN    (FA_AFTER_ROWS + 2)
+#define FA_ERASE_BTN   (FA_AFTER_ROWS + 3) /* empties the selected slot -- "Erase", not "Delete": nothing is thrown away, a slot just becomes free again */
+#define FA_START_BTN   (FA_AFTER_ROWS + 4)
+#define FA_BROWSER_BTN (FA_AFTER_ROWS + 5)
 /* Favorites is now the app's own top-level screen (dialog_run() runs ITS
  * loop directly, opening the browser as a nested call on [Browser] --
  * see dialog_run()'s own comment) -- so the program's actual Quit lives
  * here now, not in the browser (which has a plain [Back] instead, see
  * FM_BACK_BTN). Right-anchored from DW, same convention FM_PREV_BTN/
  * FM_NEXT_BTN already use for right-aligned buttons. */
-#define FA_QUIT_BTN    (FA_AFTER_ROWS + 5)
-#define FA_NOBJS       (FA_AFTER_ROWS + 6)
+#define FA_QUIT_BTN    (FA_AFTER_ROWS + 6)
+#define FA_NOBJS       (FA_AFTER_ROWS + 7)
 static OBJECT fa_dlg[FA_NOBJS];
 
 #define FA_TITLE_BUF 48
 static char fa_title_text[FA_TITLE_BUF];
+#define FA_SOURCE_BTN_BUF 16
+static char fa_source_btn_text[FA_SOURCE_BTN_BUF]; /* "Source: TNFS" / "Source: SD" -- own text doubles as the value, same idiom fm_source_btn_text used before this button moved here */
 /* Content width matches the row object's own real width (STD_FRAME_CHARS,
  * same derivation as FM_CONTENT_CHARS: dialog width minus a 1-char margin
  * each side) -- fa_refresh_rows() always pads its text out to exactly this
@@ -1377,16 +1391,22 @@ static void fa_dialog_init(void)
     if (f.short_screen)
         fa_dlg[FA_DIV3].ob_flags |= (unsigned short)HIDETREE;
 
-    set_obj(fa_dlg, FA_MOVE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl, f.ybtn, 11*lm.cw, lm.rh);
+    /* Leftmost -- same position/width [Source] had in the browser (see
+     * FA_SOURCE_BTN's own enum comment). Move/Erase/Start/Browser shifted
+     * right by that same 13cw + 1cw gap so their own spacing is unchanged. */
+    set_obj(fa_dlg, FA_SOURCE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl, f.ybtn, 13*lm.cw, lm.rh);
+    fa_dlg[FA_SOURCE_BTN].ob_spec.free_string = fa_source_btn_text;
+
+    set_obj(fa_dlg, FA_MOVE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl + 14*lm.cw, f.ybtn, 11*lm.cw, lm.rh);
     fa_dlg[FA_MOVE_BTN].ob_spec.free_string = "  Move  ";
 
-    set_obj(fa_dlg, FA_ERASE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl + 12*lm.cw, f.ybtn, 11*lm.cw, lm.rh);
+    set_obj(fa_dlg, FA_ERASE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl + 26*lm.cw, f.ybtn, 11*lm.cw, lm.rh);
     fa_dlg[FA_ERASE_BTN].ob_spec.free_string = " Erase  ";
 
-    set_obj(fa_dlg, FA_START_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl + 24*lm.cw, f.ybtn, 11*lm.cw, lm.rh);
+    set_obj(fa_dlg, FA_START_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl + 38*lm.cw, f.ybtn, 11*lm.cw, lm.rh);
     fa_dlg[FA_START_BTN].ob_spec.free_string = " Start  ";
 
-    set_obj(fa_dlg, FA_BROWSER_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl + 36*lm.cw, f.ybtn, 13*lm.cw, lm.rh);
+    set_obj(fa_dlg, FA_BROWSER_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, f.xl + 50*lm.cw, f.ybtn, 13*lm.cw, lm.rh);
     fa_dlg[FA_BROWSER_BTN].ob_spec.free_string = "  Browser  ";
 
     {
@@ -1398,39 +1418,32 @@ static void fa_dialog_init(void)
     wire_tree(fa_dlg, FA_NOBJS);
 }
 
-/* In-memory favorites model (this task) -- 60 slots (FA_TAB_COUNT pages of
- * FA_ROWS each), one full filename buffer per slot, "" meaning empty.
- * Lives for the life of the running program only: no FLOPPY.CFG/MOUNT.CFG,
- * no load/save, explicitly out of scope for this task. Sized to the
- * browser's own FLOPPY_BROWSE_NAME_LEN so the full selected filename is
- * kept, never truncated in the model itself -- only fa_refresh_rows()'s
- * own display copy is ever shortened to fit a row. */
+/* Favorites are no longer held in memory (see src/favcfg.c) -- every read
+ * or write below goes straight to that mount's own MOUNTn.CFG on disk, one
+ * favorite (or one visible page's worth of names) at a time. FA_TOTAL_SLOTS
+ * remains just the UI's own page/row bound (60 = FA_TAB_COUNT pages of
+ * FA_ROWS each); favcfg.c has its own identical constant for the same 60,
+ * kept private to that file since it never needs to be UI-shaped. */
 #define FA_TOTAL_SLOTS (FA_ROWS * FA_TAB_COUNT)
-static char fa_slots[FA_TOTAL_SLOTS][FLOPPY_BROWSE_NAME_LEN];
 
-/* Seeds the in-memory model with this task's own mockup demo content --
- * ONCE, the first time the Favorites dialog is ever opened in this run, not
- * on every open (placements made by the user must survive closing and
- * reopening the dialog, see this task's own expected user flow). */
-static void fa_slots_seed_once(void)
+/* Set once, at the top of dialog_run(), to that same call's own cfg
+ * pointer -- lets every FA_* helper below reach the CURRENT mount slot
+ * (cfg->active_index can change any time the user picks a different
+ * source, see server_selector_run()) without threading a cfg/mount_slot
+ * parameter through each of them individually. Safe: cfg outlives
+ * dialog_run() itself, so the pointer stays valid for as long as this
+ * static does. */
+static ProfileConfig *fa_cfg;
+
+/* The mount slot (1..8) favcfg.c's own functions expect, derived from
+ * fa_cfg->active_index -- or 0 (a deliberately out-of-range "no mount"
+ * value every favcfg_*() function already treats as a safe no-op/empty
+ * read) if nothing is configured/active yet. */
+static int fa_mount_slot(void)
 {
-    static const struct { int slot; const char *name; } demo[] = {
-        { 0,  "Dungeon Master (Europe) Disk 1" },
-        { 1,  "Dungeon Master (Europe) Disk 2" },
-        { 2,  "Lotus Esprit Turbo Challenge II" },
-        { 14, "Monkey Island Disk 4" },
-    };
-    static int seeded = 0;
-    int i;
-
-    if (seeded)
-        return;
-    seeded = 1;
-
-    for (i = 0; i < FA_TOTAL_SLOTS; i++)
-        fa_slots[i][0] = '\0';
-    for (i = 0; i < (int)(sizeof(demo) / sizeof(demo[0])); i++)
-        set_buf(fa_slots[demo[i].slot], FLOPPY_BROWSE_NAME_LEN, demo[i].name);
+    if (!fa_cfg || fa_cfg->active_index < 0 || fa_cfg->active_index >= MAX_PROFILES)
+        return 0;
+    return fa_cfg->active_index + 1;
 }
 
 /* G_STRING objects have no fill of their own -- objc_draw() only paints
@@ -1455,10 +1468,20 @@ static void fa_refresh_rows(void)
 {
     int i;
     int base = fa_current_page * FA_ROWS; /* slot NUMBERING must follow the active tab -- page 1 (16-30) shows 16..30, not 01..15 again */
+    int mount_slot = fa_mount_slot();
+    char names[FA_ROWS][FAVCFG_NAME_LEN];
+
+    /* One open/read of MOUNTn.CFG for the whole page, not FA_ROWS (15)
+     * separate ones -- see favcfg_read_page_names()'s own comment. On a
+     * TNFS-backed drive each separate file open has its own real network
+     * cost, which is what made building a page of favorites visibly slow
+     * (and left the screen blank for a moment right after startup, since
+     * this runs before the dialog's first dialog_open()). */
+    favcfg_read_page_names(mount_slot, base + 1, FA_ROWS, names);
 
     for (i = 0; i < FA_ROWS; i++) {
         int slot = base + i;
-        const char *name = fa_slots[slot][0] != '\0' ? fa_slots[slot] : "<empty>";
+        const char *name = names[i][0] != '\0' ? names[i] : "<empty>";
         sprintf(fa_row_text[i], "%02d  %-*.*s", slot + 1,
                 FA_CONTENT_CHARS - 4, FA_CONTENT_CHARS - 4, name);
         fa_dlg[FA_ROW(i)].ob_state &= (unsigned short)(~SELECTED);
@@ -1485,6 +1508,7 @@ typedef enum {
 } FavoritesMode;
 static FavoritesMode fa_mode;
 static char fa_place_name[FLOPPY_BROWSE_NAME_LEN]; /* the browser filename waiting to be placed -- valid only while fa_mode == FAVORITES_MODE_PLACE */
+static char fa_place_dir[FLOPPY_BROWSE_CWD_LEN]; /* the browser's own current directory at the time fa_place_name was captured -- stored alongside it, same lifetime */
 static int fa_move_source_slot = -1; /* absolute slot (0..FA_TOTAL_SLOTS-1) being moved -- valid only while fa_mode == FAVORITES_MODE_MOVE */
 
 /* Maps an absolute screen point to a favorite ROW index (0..FA_ROWS-1) on
@@ -1564,14 +1588,16 @@ static void fa_redraw_row(int row)
 static void fa_start_selected(void)
 {
     int slot;
+    char name[FAVCFG_NAME_LEN], dir[FAVCFG_DIR_LEN];
     char msg[300];
 
     if (fa_selected_row < 0)
         return;
     slot = fa_current_page * FA_ROWS + fa_selected_row;
-    if (fa_slots[slot][0] == '\0')
+    favcfg_read_entry(fa_mount_slot(), slot + 1, name, sizeof(name), dir, sizeof(dir));
+    if (name[0] == '\0')
         return;
-    sprintf(msg, "[1][Now starting:|%-.60s][OK]", fa_slots[slot]);
+    sprintf(msg, "[1][Now starting:|%-.60s\\%-.60s][OK]", dir, name);
     form_alert(1, msg);
 }
 
@@ -1590,7 +1616,7 @@ static void fa_erase_selected(void)
         return;
     row = fa_selected_row;
     slot = fa_current_page * FA_ROWS + row;
-    fa_slots[slot][0] = '\0';
+    favcfg_erase_entry(fa_mount_slot(), slot + 1);
     fa_refresh_rows();
     fa_redraw_row(row); /* only this one row changed -- same reasoning as the PLACE MODE placement code */
 }
@@ -1683,20 +1709,26 @@ static void fa_deselect(void)
     fa_redraw_row(row);
 }
 
-/* Computes the FA_TITLE text from cfg's own active profile -- shared by
- * dialog_run()'s own startup and by its post-Browser refresh (the active
- * source can change while the nested browser is open, via its own
- * [Source] button), per this task's own "Favorites - <server nickname>"
- * requirement. */
+static const char *profile_backend_word(const Profile *p); /* defined below -- see that definition's own comment */
+
+/* Computes the FA_TITLE and FA_SOURCE_BTN text from cfg's own active
+ * profile -- shared by dialog_run()'s own startup and by its post-Browser/
+ * post-Source refresh (the active source can change via either [Browser]'s
+ * own nested [Source] history or FA_SOURCE_BTN itself), per this task's
+ * own "Favorites - <server nickname>" requirement. */
 static void fa_update_title(const ProfileConfig *cfg)
 {
     int have_active = (cfg->active_index >= 0 && cfg->active_index < MAX_PROFILES
                         && profile_slot_is_configured(&cfg->profiles[cfg->active_index]));
 
-    if (have_active)
+    if (have_active) {
         sprintf(fa_title_text, "Favorites - %-.30s", cfg->profiles[cfg->active_index].nickname);
-    else
+        sprintf(fa_source_btn_text, "Source: %s", profile_backend_word(&cfg->profiles[cfg->active_index]));
+    } else {
         sprintf(fa_title_text, "Favorites - (no source)");
+        strncpy(fa_source_btn_text, "Source", sizeof(fa_source_btn_text) - 1);
+        fa_source_btn_text[sizeof(fa_source_btn_text) - 1] = '\0';
+    }
 }
 
 /* 16, not the LFN browser's own 25-per-page figure (RESEARCH-STEP0.md) --
@@ -1900,18 +1932,20 @@ enum {
 #define FM_ROW(i)      (FM_ROW_BASE + (i))
 #define FM_AFTER_ROWS  (FM_ROW_BASE + FM_MAX_VISIBLE_FILES)
 #define FM_DIV3          (FM_AFTER_ROWS + 0)
-#define FM_SOURCE_BTN    (FM_AFTER_ROWS + 1)
-#define FM_DIRUP_BTN     (FM_AFTER_ROWS + 2)
-#define FM_ADD_BTN (FM_AFTER_ROWS + 3)
-#define FM_BACK_BTN      (FM_AFTER_ROWS + 4) /* cancel back to Favorites -- see fm_browse_run()'s own comment. The program's actual Quit lives on Favorites now (FA_QUIT_BTN). */
+/* [Source] used to live here -- moved to Favorites (FA_SOURCE_BTN), same
+ * position (leftmost of its button row), per this task's own request.
+ * DirUp/Add/Back shifted left to fill the gap it left behind. */
+#define FM_DIRUP_BTN     (FM_AFTER_ROWS + 1)
+#define FM_ADD_BTN (FM_AFTER_ROWS + 2)
+#define FM_BACK_BTN      (FM_AFTER_ROWS + 3) /* cancel back to Favorites -- see fm_browse_run()'s own comment. The program's actual Quit lives on Favorites now (FA_QUIT_BTN). */
 /* Placeholder for pagination -- buttons only for now, no paging logic
  * wired in yet: GET_PAGE already supports an arbitrary page_index on the
  * protocol/firmware side (one combined dirs-then-files page per call, see
  * FloppyPageResult's own comment), but fm_load_entries() only ever asks
  * for page 0. Clicking either does nothing yet. */
-#define FM_PREV_BTN      (FM_AFTER_ROWS + 5)
-#define FM_NEXT_BTN      (FM_AFTER_ROWS + 6)
-#define FM_NOBJS         (FM_AFTER_ROWS + 7)
+#define FM_PREV_BTN      (FM_AFTER_ROWS + 4)
+#define FM_NEXT_BTN      (FM_AFTER_ROWS + 5)
+#define FM_NOBJS         (FM_AFTER_ROWS + 6)
 static OBJECT fm_dlg[FM_NOBJS];
 
 /* 78 characters wide -- the Atari ST's own medium/high resolution text
@@ -1929,8 +1963,6 @@ static OBJECT fm_dlg[FM_NOBJS];
 static char fm_title_text[FM_TITLE_BUF]; /* current directory (or a placeholder) -- see fm_refresh() */
 static char fm_source_line[FM_SOURCE_BUF];
 static char fm_row_text[FM_MAX_VISIBLE_FILES][FM_ROW_BUF];
-#define FM_SOURCE_BTN_BUF 16
-static char fm_source_btn_text[FM_SOURCE_BTN_BUF]; /* "Source: TNFS" / "Source: SD" -- own text doubles as the value, same idiom as Active/Source toggles elsewhere */
 static int fm_selected_row = -1; /* -1 = no file selected */
 static int fm_short_screen; /* set by fm_dialog_init(), read by dialog_run() to open flush top-left instead of centered -- see dialog_open()'s own comment */
 
@@ -2066,16 +2098,17 @@ static void fm_dialog_init(void)
     if (lm.short_screen)
         fm_dlg[FM_DIV3].ob_flags |= (unsigned short)HIDETREE;
 
-    set_obj(fm_dlg, FM_SOURCE_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 1*lm.cw, ybtn, 13*lm.cw, lm.rh);
-    fm_dlg[FM_SOURCE_BTN].ob_spec.free_string = fm_source_btn_text;
-
-    set_obj(fm_dlg, FM_DIRUP_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 15*lm.cw, ybtn, 13*lm.cw, lm.rh);
+    /* [Source] used to be leftmost here -- moved to Favorites (see
+     * FM_DIRUP_BTN's own enum comment). DirUp/Add/Back shifted left by
+     * exactly the 14cw [Source] + gap used to occupy, so the gaps between
+     * them are unchanged. */
+    set_obj(fm_dlg, FM_DIRUP_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 1*lm.cw, ybtn, 13*lm.cw, lm.rh);
     fm_dlg[FM_DIRUP_BTN].ob_spec.free_string = "   Dir Up   ";
 
-    set_obj(fm_dlg, FM_ADD_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 29*lm.cw, ybtn, 9*lm.cw, lm.rh);
+    set_obj(fm_dlg, FM_ADD_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 15*lm.cw, ybtn, 9*lm.cw, lm.rh);
     fm_dlg[FM_ADD_BTN].ob_spec.free_string = "   Add   ";
 
-    set_obj(fm_dlg, FM_BACK_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 39*lm.cw, ybtn, 8*lm.cw, lm.rh);
+    set_obj(fm_dlg, FM_BACK_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 25*lm.cw, ybtn, 8*lm.cw, lm.rh);
     fm_dlg[FM_BACK_BTN].ob_spec.free_string = " Back  ";
 
     /* Far right, reserved for pagination (Step 3+) -- no paging logic
@@ -2155,7 +2188,6 @@ static void fm_refresh(ProfileConfig *cfg)
     if (have_active) {
         p = &cfg->profiles[cfg->active_index];
         sprintf(fm_source_line, "Source: %-.20s   Type: %s", p->nickname, profile_backend_word(p));
-        sprintf(fm_source_btn_text, "Source: %s", profile_backend_word(p));
 
         if (fm_open_browse_for_active_profile(cfg)) {
             fm_load_entries();
@@ -2174,8 +2206,6 @@ static void fm_refresh(ProfileConfig *cfg)
         strncpy(fm_cwd, "/Floppies", sizeof(fm_cwd) - 1);
         fm_cwd[sizeof(fm_cwd) - 1] = '\0';
         sprintf(fm_source_line, "Source: (none selected)");
-        strncpy(fm_source_btn_text, "Source", sizeof(fm_source_btn_text) - 1);
-        fm_source_btn_text[sizeof(fm_source_btn_text) - 1] = '\0';
     }
 
     fm_apply_entries_to_rows();
@@ -2189,13 +2219,16 @@ static void fm_refresh(ProfileConfig *cfg)
  * [Add] button (FM_ADD_BTN's own case). A directory row
  * double-click never reaches this at all -- it navigates into the
  * directory instead. */
-static void fm_capture_selection(char *out_name, int out_name_cap)
+static void fm_capture_selection(char *out_name, int out_name_cap, char *out_dir, int out_dir_cap)
 {
     if (fm_selected_row >= 0 && fm_selected_row < fm_entry_count
-        && !fm_entries[fm_selected_row].is_dir)
+        && !fm_entries[fm_selected_row].is_dir) {
         set_buf(out_name, out_name_cap, fm_entries[fm_selected_row].name);
-    else
+        set_buf(out_dir, out_dir_cap, fm_cwd);
+    } else {
         out_name[0] = '\0';
+        out_dir[0] = '\0';
+    }
 }
 
 /* objc_find() only matches a click that lands exactly inside a row's own
@@ -2418,9 +2451,6 @@ static short fm_form_do_events(int *out_double)
                 /* Right arrow: same as [Next] -- see the Left-arrow
                  * comment just above, mirrored for fm_has_next. */
                 result = (short)FM_NEXT_BTN;
-            } else if (scan == 0x1F) {
-                /* S: same as [Source]. Scan code, standard AT/Atari S. */
-                result = (short)FM_SOURCE_BTN;
             } else if (scan == 0x0E || (kr & 0x00FF) == 0x08) {
                 /* Backspace: same as [Dir Up]. Scan code (standard AT/
                  * Atari Backspace) and ASCII (0x08) both checked, same
@@ -2446,13 +2476,13 @@ static short fm_form_do_events(int *out_double)
  * [Back] (or confirmed with nothing/a directory selected), in which case
  * out_name is left empty. Either way, control always returns to the
  * caller; this function never talks to the Favorites dialog directly. */
-static int fm_browse_run(ProfileConfig *cfg, char *out_name, int out_name_cap)
+static int fm_browse_run(ProfileConfig *cfg, char *out_name, int out_name_cap,
+                          char *out_dir, int out_dir_cap)
 {
     DialogGeometry geo;
     short which;
     int done, confirmed;
     int is_double;
-    int selector_result;
 
     fm_dialog_init();
     fm_refresh(cfg);
@@ -2498,7 +2528,7 @@ static int fm_browse_run(ProfileConfig *cfg, char *out_name, int out_name_cap)
                     /* A file: confirm and return to the caller (Favorites,
                      * see dialog_run() below), same outcome as the
                      * [Add] button. */
-                    fm_capture_selection(out_name, out_name_cap);
+                    fm_capture_selection(out_name, out_name_cap, out_dir, out_dir_cap);
                     confirmed = 1;
                     done = 1;
                 }
@@ -2507,21 +2537,6 @@ static int fm_browse_run(ProfileConfig *cfg, char *out_name, int out_name_cap)
         }
 
         switch (which) {
-        case FM_SOURCE_BTN:
-            /* server_selector_run()/edit_servers_run() are themselves
-             * interactive dialogs -- the user is choosing, not waiting on
-             * the Pico, so they keep the normal arrow. The busy cursor
-             * only brackets fm_refresh()'s own TNFS/SD round trip and the
-             * resulting redraw. */
-            selector_result = server_selector_run(cfg);
-            if (selector_result == 2)
-                edit_servers_run(cfg);
-            graf_mouse(HOURGLASS, 0L);
-            fm_refresh(cfg);
-            objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
-            graf_mouse(ARROW, 0L);
-            break;
-
         case FM_DIRUP_BTN:
             /* Replaces the old separate Change Dir dialog's ".." row --
              * directories now show inline in the main row list (see
@@ -2553,7 +2568,7 @@ static int fm_browse_run(ProfileConfig *cfg, char *out_name, int out_name_cap)
         case FM_ADD_BTN:
             /* Confirm and return, selection or not -- see
              * fm_capture_selection()'s own comment. */
-            fm_capture_selection(out_name, out_name_cap);
+            fm_capture_selection(out_name, out_name_cap, out_dir, out_dir_cap);
             confirmed = 1;
             done = 1;
             break;
@@ -2591,6 +2606,7 @@ static int fm_browse_run(ProfileConfig *cfg, char *out_name, int out_name_cap)
              * [Favorites]/double-click/Enter, which confirm the current
              * selection (or lack of one). */
             out_name[0] = '\0';
+            out_dir[0] = '\0';
             confirmed = 0;
             done = 1;
             break;
@@ -2611,6 +2627,7 @@ static int fm_browse_run(ProfileConfig *cfg, char *out_name, int out_name_cap)
 static int fa_open_browser(ProfileConfig *cfg, int hand_shown)
 {
     char browsed_name[FLOPPY_BROWSE_NAME_LEN];
+    char browsed_dir[FLOPPY_BROWSE_CWD_LEN];
     short mx, my, mb, ks;
     short row_x, row_y, row_w, row_h;
 
@@ -2623,14 +2640,17 @@ static int fa_open_browser(ProfileConfig *cfg, int hand_shown)
      * FAVORITES_MODE_MOVE, so this reset is defensive tidiness, not a
      * correctness fix. */
     fa_move_source_slot = -1;
-    if (fm_browse_run(cfg, browsed_name, (int)sizeof(browsed_name))) {
+    if (fm_browse_run(cfg, browsed_name, (int)sizeof(browsed_name),
+                       browsed_dir, (int)sizeof(browsed_dir))) {
         fa_mode = FAVORITES_MODE_PLACE;
         set_buf(fa_place_name, FLOPPY_BROWSE_NAME_LEN, browsed_name);
+        set_buf(fa_place_dir, FLOPPY_BROWSE_CWD_LEN, browsed_dir);
     } else {
         fa_mode = FAVORITES_MODE_NORMAL;
         fa_place_name[0] = '\0';
+        fa_place_dir[0] = '\0';
     }
-    fa_update_title(cfg); /* the source may have changed via the browser's own [Source] button */
+    fa_update_title(cfg);
     fa_refresh_rows();
     objc_draw(fa_dlg, FA_ROOT, MAX_DEPTH, fa_dlg[FA_ROOT].ob_x, fa_dlg[FA_ROOT].ob_y,
               fa_dlg[FA_ROOT].ob_width, fa_dlg[FA_ROOT].ob_height);
@@ -2652,6 +2672,35 @@ static int fa_open_browser(ProfileConfig *cfg, int hand_shown)
     return hand_shown;
 }
 
+/* Opens the server/source selector -- server_selector_run() (and
+ * edit_servers_run() if that returns "edit") -- shared with the
+ * browser's own former [Source] button, now moved here (FA_SOURCE_BTN,
+ * dialog_run()'s own MU_BUTTON handling, and the S key). Refreshes the
+ * title/Source button text and the favorites page afterward, since
+ * switching the active source also switches which mount's favorites are
+ * shown (fa_mount_slot() follows cfg->active_index directly). Silently
+ * cancels any pending PLACE/MOVE MODE first, same defensive reasoning as
+ * fa_open_browser()'s own comment -- a placement or move armed against
+ * the OLD source no longer makes sense once the source itself changes. */
+static void fa_open_source(ProfileConfig *cfg)
+{
+    int selector_result;
+
+    fa_move_source_slot = -1;
+    fa_mode = FAVORITES_MODE_NORMAL;
+    fa_place_name[0] = '\0';
+    fa_place_dir[0] = '\0';
+
+    selector_result = server_selector_run(cfg);
+    if (selector_result == 2)
+        edit_servers_run(cfg);
+
+    fa_update_title(cfg);
+    fa_refresh_rows();
+    objc_draw(fa_dlg, FA_ROOT, MAX_DEPTH, fa_dlg[FA_ROOT].ob_x, fa_dlg[FA_ROOT].ob_y,
+              fa_dlg[FA_ROOT].ob_width, fa_dlg[FA_ROOT].ob_height);
+}
+
 /* The app's own top-level screen (see this file's own Favorites-dialog
  * section header comment) -- called once from main.c. Opens the browser
  * (fm_browse_run(), FM_* section above) as a nested dialog on [Browser];
@@ -2666,21 +2715,63 @@ void dialog_run(ProfileConfig *cfg)
     short row_x, row_y, row_w, row_h;
     int done, hand_shown;
 
+    /* "Please wait" goes up FIRST, before anything else -- favcfg_init()
+     * (a couple of GEMDOS Dgetdrv()/Dgetpath() calls) and
+     * favcfg_startup_validate() below (real FLOPPY.CFG file I/O, which
+     * can be slow on a TNFS-backed drive) both used to run before this
+     * was shown, or after it had already been hidden again, leaving a
+     * silent, unexplained pause either side of the notice. Now the whole
+     * startup I/O sequence -- firmware profile fetch AND favorites-config
+     * load/validate -- runs while the SAME notice stays up throughout. */
+    pw_dialog_show();
+
+    fa_cfg = cfg;
+    favcfg_init();
+
     shared_fields_init();
 
-    pw_dialog_show();
     startup_load(cfg);
-    pw_dialog_hide();
 
-    fa_slots_seed_once();
+    /* Restore the last source the user actually picked via [Source], if
+     * it's still a configured slot -- picking a source only ever changes
+     * cfg->active_index in RAM (see favcfg_write_active_slot()'s own
+     * comment), so without this the firmware's own (flash-only, Save-
+     * triggered) active profile is all startup_load() above has to go
+     * on, which is not the same thing and can silently revert a source
+     * switch the user never explicitly "Saved". A stale remembered slot
+     * (no longer configured, or none ever remembered) leaves
+     * cfg->active_index exactly as startup_load() set it. */
+    {
+        int remembered = favcfg_read_active_slot();
+        if (remembered >= 1 && remembered <= MAX_PROFILES
+            && profile_slot_is_configured(&cfg->profiles[remembered - 1]))
+            cfg->active_index = remembered - 1;
+    }
+
+    /* cfg now holds the 8 mount slots as the firmware/FLASH itself just
+     * reported them -- compare against CONFIG.CFG's own record of what
+     * they were last time, and reset any slot that no longer matches
+     * (mount reused for a different server/path/type/port since last
+     * run) before a single favorite is shown. Missing/first-run files are
+     * silently fine, never alerted -- see src/favcfg.c. */
+    favcfg_startup_validate(cfg);
+
+    /* fa_refresh_rows() (the very first page build) stays covered too --
+     * it runs before dialog_open() below draws anything at all, so any
+     * time it takes would otherwise show up as a blank screen rather
+     * than the "please wait" notice that's already up anyway. */
     fa_dialog_init();
     fa_current_page = 0;
     fa_update_title(cfg);
     fa_refresh_rows();
+
+    pw_dialog_hide();
+
     dialog_open(fa_dlg, FA_ROOT, &geo, fa_short_screen);
 
     fa_mode = FAVORITES_MODE_NORMAL; /* nothing browsed yet at program start */
     fa_place_name[0] = '\0';
+    fa_place_dir[0] = '\0';
 
     /* Absolute screen rect of the whole row-list area (not per-row -- see
      * this task's own "FLAT_HAND while the mouse is over the favorite
@@ -2730,7 +2821,10 @@ void dialog_run(ProfileConfig *cfg)
                 if (row >= 0) {
                     int slot = fa_current_page * FA_ROWS + row;
 
-                    set_buf(fa_slots[slot], FLOPPY_BROWSE_NAME_LEN, fa_place_name);
+                    /* Persists immediately -- a streaming rewrite of this
+                     * mount's own MOUNTn.CFG, see favcfg_write_entry(). No
+                     * separate Save step exists anywhere in this app. */
+                    favcfg_write_entry(fa_mount_slot(), slot + 1, fa_place_name, fa_place_dir);
                     fa_refresh_rows();
                     fa_redraw_row(row); /* only this one row changed -- see fa_redraw_row()'s own comment on why a plain objc_draw() of just the row isn't enough by itself */
 
@@ -2741,6 +2835,7 @@ void dialog_run(ProfileConfig *cfg)
                      * step, also per this task's own brief. */
                     fa_mode = FAVORITES_MODE_NORMAL;
                     fa_place_name[0] = '\0';
+                    fa_place_dir[0] = '\0';
                     graf_mouse(ARROW, 0L);
                     placed = 1;
                 }
@@ -2756,10 +2851,14 @@ void dialog_run(ProfileConfig *cfg)
                         int source_page = fa_move_source_slot / FA_ROWS;
                         int source_row = fa_move_source_slot % FA_ROWS;
 
-                        set_buf(fa_slots[dest_slot], FLOPPY_BROWSE_NAME_LEN, fa_slots[fa_move_source_slot]);
-                        fa_slots[fa_move_source_slot][0] = '\0';
+                        /* A true swap, not a one-way overwrite -- if the
+                         * destination already held a favorite, it moves
+                         * to the source slot rather than being lost (see
+                         * favcfg_move_entry()'s own comment). Persists
+                         * immediately, same as Place/Erase. */
+                        favcfg_move_entry(fa_mount_slot(), fa_move_source_slot + 1, dest_slot + 1);
 
-                        fa_refresh_rows(); /* current page only -- rebuilds fa_row_text[]/tab highlight from fa_slots[] */
+                        fa_refresh_rows(); /* current page only -- rebuilds fa_row_text[]/tab highlight from MOUNTn.CFG */
                         fa_redraw_row(row); /* destination -- always on the current page */
                         if (source_page == fa_current_page)
                             fa_redraw_row(source_row); /* source also visible on this same page -- redraw it too */
@@ -2782,6 +2881,8 @@ void dialog_run(ProfileConfig *cfg)
                             fa_dlg[which].ob_state &= (unsigned short)(~SELECTED);
                         if (which >= FA_TAB_BASE && which < FA_AFTER_TABS) {
                             fa_switch_page(which - FA_TAB_BASE);
+                        } else if (which == FA_SOURCE_BTN) {
+                            fa_open_source(cfg);
                         } else if (which == FA_BROWSER_BTN) {
                             hand_shown = fa_open_browser(cfg, hand_shown);
                         } else if (which == FA_MOVE_BTN) {
@@ -2840,6 +2941,11 @@ void dialog_run(ProfileConfig *cfg)
                  * Tab) and ASCII (0x09) both checked, same dual-check
                  * convention Esc already established. */
                 hand_shown = fa_open_browser(cfg, hand_shown);
+            } else if (scan == 0x1F) {
+                /* S: same as [Source] -- scan code, standard AT/Atari S,
+                 * same shortcut the browser's own former [Source] button
+                 * used before it moved here. */
+                fa_open_source(cfg);
             } else if (scan == 0x3B) {
                 fa_switch_page(0); /* F1 -> 01-15 */
             } else if (scan == 0x3C) {
@@ -2856,9 +2962,7 @@ void dialog_run(ProfileConfig *cfg)
                  * default button (form_alert()'s own first argument) so
                  * an accidental Return/click doesn't wipe everything. */
                 if (form_alert(2, "[3][Erase all 60 slots?][Erase|Cancel]") == 1) {
-                    int i;
-                    for (i = 0; i < FA_TOTAL_SLOTS; i++)
-                        fa_slots[i][0] = '\0';
+                    favcfg_erase_all(fa_mount_slot());
                     fa_refresh_rows();
                     objc_draw(fa_dlg, FA_ROOT, MAX_DEPTH, fa_dlg[FA_ROOT].ob_x, fa_dlg[FA_ROOT].ob_y,
                               fa_dlg[FA_ROOT].ob_width, fa_dlg[FA_ROOT].ob_height);

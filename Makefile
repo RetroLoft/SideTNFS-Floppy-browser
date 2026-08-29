@@ -11,7 +11,7 @@ CFLAGS     = -Wall -Wextra -O1 -m68000 -fno-strict-aliasing \
 LDFLAGS    = -s -lgem
 
 TARGET      = FLOPPY.PRG
-SRCS        = src/main.c src/profile.c src/floppy_probe.c src/dialog.c
+SRCS        = src/main.c src/profile.c src/floppy_probe.c src/dialog.c src/favcfg.c
 INSTALLDIR  = /mnt/retroloft/retro/Atari.ST/CONFIG
 
 # 'all' always installs too, same convention SideTNFS-Config's own

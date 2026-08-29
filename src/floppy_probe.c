@@ -411,29 +411,62 @@ static int browse_get_page_once(unsigned long generation, unsigned long page_ind
  * large directory walked a handful of TNFS entries at a time per poll. */
 #define PAGE_POLL_TIMEOUT_SEC 30
 
+/* A handful of quick, blind retries specifically for
+ * FLOPPY_BROWSE_ERR_BACKEND_ERROR -- the firmware's catch-all for "the
+ * TNFS/SD backend didn't cooperate", seen in practice roughly 1 in 10
+ * listings and going away on its own on a later attempt. Confirmed with
+ * the firmware side to be retry-safe: a BACKEND_ERROR only aborts that
+ * one walk attempt (walk_active=false) and never touches the browse
+ * session/generation itself, so a fresh identical GET_PAGE request is a
+ * clean retry, no state to reconcile. It's also the expected statistical
+ * tail of a *bounded* (not infinite) per-round TNFS retry inside the
+ * firmware -- a directory walk needs many more network rounds than a
+ * single file op, so the rare chance of one round exhausting its own
+ * retries compounds over a whole page. No artificial delay between
+ * attempts: a retry's own walk (via browse_get_page_poll()'s normal
+ * IN_PROGRESS handling below) already takes however long it naturally
+ * needs, so inserting a fixed pause first would just be an arbitrary
+ * extra wait rather than anything calibrated to real page-fetch timing.
+ * Capped low so a genuinely persistent backend problem still reaches the
+ * user promptly instead of retrying indefinitely. */
+#define BACKEND_ERROR_RETRY_COUNT 3
+
 /* Re-issues the IDENTICAL GET_PAGE request (same generation/page_index)
  * for as long as the firmware reports FLOPPY_BROWSE_STATUS_IN_PROGRESS --
  * see sidetnfs_floppy_browse.h's own contract: the firmware never finishes
  * a deep/slow TNFS walk inside one blocking call, so the Atari side is the
- * one that keeps asking "is it ready yet" instead. Transparent to
- * floppy_probe_browse_get_page() -- out->status is never
+ * one that keeps asking "is it ready yet" instead. Also silently retries a
+ * few times on FLOPPY_BROWSE_ERR_BACKEND_ERROR (see that constant's own
+ * comment above) before giving up and handing it back to the caller.
+ * Transparent to floppy_probe_browse_get_page() -- out->status is never
  * FLOPPY_BROWSE_STATUS_IN_PROGRESS by the time this returns
- * FLOPPY_PROBE_OK. */
+ * FLOPPY_PROBE_OK, and is FLOPPY_BROWSE_ERR_BACKEND_ERROR only once every
+ * retry has already been used up. */
 static int browse_get_page_poll(unsigned long generation, unsigned long page_index, FloppyPageResult *out)
 {
     long budget = (long)PAGE_POLL_TIMEOUT_SEC * PAL_VBLS_PER_SEC;
+    int backend_retries_left = BACKEND_ERROR_RETRY_COUNT;
     int rc;
 
     for (;;) {
         rc = browse_get_page_once(generation, page_index, out);
         if (rc != FLOPPY_PROBE_OK)
             return rc;
-        if (out->status != FLOPPY_BROWSE_STATUS_IN_PROGRESS)
-            return FLOPPY_PROBE_OK;
-        if (budget <= 0)
-            return FLOPPY_PROBE_TIMEOUT;
-        Vsync();
-        budget--;
+
+        if (out->status == FLOPPY_BROWSE_STATUS_IN_PROGRESS) {
+            if (budget <= 0)
+                return FLOPPY_PROBE_TIMEOUT;
+            Vsync();
+            budget--;
+            continue;
+        }
+
+        if (out->status == FLOPPY_BROWSE_ERR_BACKEND_ERROR && backend_retries_left > 0) {
+            backend_retries_left--;
+            continue;
+        }
+
+        return FLOPPY_PROBE_OK;
     }
 }
 
