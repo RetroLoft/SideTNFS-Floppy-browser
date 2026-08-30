@@ -51,6 +51,70 @@ This is the first implementation phase. It provides:
 See `RESEARCH-STEP0.md` in this repository for the architecture research
 and design rationale this project is built on.
 
+## Keyboard shortcuts
+
+Every screen is fully usable with the keyboard alone -- the mouse is never
+required. Up/Down always move a highlighted row; Enter/Space confirm it;
+Esc always cancels/backs out.
+
+### Favorites (the main screen)
+
+| Key | Action |
+| --- | --- |
+| Up / Down | Move the row selection (or, while placing/moving a favorite, the target row) |
+| Enter / Space | Start the selected favorite; while placing/moving, confirm onto the highlighted row |
+| Delete | Erase the selected favorite |
+| Ctrl+Delete | Erase all 60 favorites on this source (asks for confirmation) |
+| M | Move the selected favorite |
+| Esc | Deselect; while placing/moving, cancel it |
+| Tab | Open the file Browser (also cancels a pending place/move) |
+| S | Open the Source selector |
+| F1 / F2 / F3 / F4 | Switch to page 01-15 / 16-30 / 31-45 / 46-60 |
+| Undo | Quit |
+
+### File Browser
+
+| Key | Action |
+| --- | --- |
+| Up / Down | Move the row selection |
+| Enter | Confirm the selected file (same as double-click or [Add]) |
+| Left / Right arrow | Previous / next page |
+| Backspace | Go up one directory |
+| Tab / Undo | Back to Favorites |
+| Esc | Deselect the current row |
+
+### Source selector
+
+| Key | Action |
+| --- | --- |
+| Up / Down | Move the row highlight |
+| Enter | Activate the highlighted source and close |
+| E | Edit sources... |
+| Esc | Cancel |
+
+### Edit Sources overview
+
+| Key | Action |
+| --- | --- |
+| Up / Down | Move the row highlight |
+| Space | Edit/Add the highlighted slot |
+| 1-8 | Edit/Add that slot directly, regardless of the current highlight |
+| Enter | Same as [OK] |
+| S | Save (pushes all 8 profiles to the cartridge's flash) |
+| Esc | Cancel |
+
+### Floppy Source editor (Nickname/Host/Port/Mount/SD path)
+
+| Key | Action |
+| --- | --- |
+| Tab / Shift+Tab, arrow keys | Move between fields (standard text-field navigation) |
+| F1 | Set Source to TNFS |
+| F2 | Set Source to SD card |
+| Ctrl+A | Toggle Active/Inactive |
+| Ctrl+R | Remove this source (asks for confirmation) |
+| Esc | Cancel |
+| Return | Same as [OK] (when not otherwise consumed by the focused field) |
+
 ## Requirements
 
 Building `FLOPPY.PRG` needs a cross-compiler that runs *on your Linux/PC

@@ -130,13 +130,6 @@ static void buf_copy(const char *buf, char *dest, int destlen)
     while (n > 0 && dest[n-1] == ' ') dest[--n] = '\0';
 }
 
-/* Wait for left mouse button to be released (for use after TOUCHEXIT). */
-static void wait_mouse_release(void)
-{
-    short mx, my, mb, mk;
-    do { graf_mkstate(&mx, &my, &mb, &mk); } while (mb & 1);
-}
-
 /* ================================================================== */
 /* New shared helpers (RESEARCH-STEP0.md's recommended cleanup)        */
 /* ================================================================== */
@@ -256,15 +249,6 @@ static void std_frame_get(StdFrame *f, const LayoutMetrics *lm, int row_count)
     f->ydiv3 = f->yrow0 + row_count * lm->pitch + 2;
     f->DH = lm->short_screen ? (f->ybtn + lm->rh + 1) : (f->ybtn + lm->rh + lm->tm + 3);
     f->root_spec = lm->short_screen ? 0x00001070L : 0x00031070L;
-}
-
-/* One form_do() call plus the mandatory TOUCHEXIT mouse-release wait
- * (see the file header comment). Returns the clicked object's id. */
-static short dialog_click(OBJECT *tree, int start_obj)
-{
-    short which = (short)(form_do(tree, start_obj) & 0x7FFF);
-    wait_mouse_release();
-    return which;
 }
 
 /* Minimal "please wait" notice, shown for the one-time startup probe
@@ -856,15 +840,46 @@ static void fp_save_to_profile(Profile *p)
 /* Returns 2 if the profile was removed (cleared to EMPTY), 1 if
  * added/modified, 0 if cancelled without changes. index is always a
  * valid fixed slot 0..MAX_PROFILES-1. */
+/* Is obj one of the 5 EDITABLE text fields on fp_dlg? Guards the custom
+ * loop's own focus-tracking below: objc_edit() assumes ob_spec.tedinfo,
+ * and calling it on some other object (a G_STRING label, a button) would
+ * read that object's ob_spec union as a TEDINFO pointer it never is --
+ * exactly the kind of object-state mistake this project's own past
+ * real-hardware crashes came from, so this is checked explicitly rather
+ * than assumed. */
+static int fp_is_editable(short obj)
+{
+    return obj == FP_NICK_EDIT || obj == FP_HOST_EDIT || obj == FP_PORT_EDIT
+        || obj == FP_MOUNT_EDIT || obj == FP_SDPATH_EDIT;
+}
+
+/* Custom evnt_multi() loop instead of dialog_click()/form_do() -- needed
+ * for the Esc/F1/F2/Ctrl+A/Ctrl+R shortcuts below, none of which form_do()
+ * has any way to expose to the caller. Unlike the FS_ and FE_ dialogs
+ * (server_selector_run()/edit_servers_run()), this dialog has real
+ * EDITABLE text fields, so a
+ * plain form_button()-only loop isn't enough -- text editing itself is
+ * driven by AES's own form_keybd() + objc_edit(), the exact same pair
+ * form_do() uses internally to do it (form_keybd() decides whether a key
+ * moves focus to a different field or an EXIT object, or should be
+ * inserted into the current one; objc_edit() actually inserts/deletes/
+ * moves the cursor). This pairing is a well-established, working pattern
+ * for a form_do() replacement that still needs live text fields -- not
+ * this project's own invention. */
 static int fp_editor_run(ProfileConfig *cfg, int index)
 {
     DialogGeometry geo;
     short which;
     int done;
-    int first_form_do = 1;
     int is_new = profile_slot_is_empty(&cfg->profiles[index]);
     Profile working;
     char msg[200];
+
+    short edit_ob, next_ob, idx;
+    short mx, my, mb, ks, kr, br;
+    short kmsg[8];
+    short event, obj;
+    int cont;
 
     if (is_new) {
         memset(&working, 0, sizeof(working));
@@ -880,58 +895,134 @@ static int fp_editor_run(ProfileConfig *cfg, int index)
     fp_load_from_profile(&working, is_new);
     dialog_open(fp_dlg, FP_ROOT, &geo, 0);
 
+    /* Auto-focus Nickname the instant the dialog opens, same as the
+     * original form_do()-based version. Unlike that version, this is one
+     * continuous loop rather than a series of separate form_do() calls,
+     * so there is only this one "first" moment to handle -- see the
+     * FP_SOURCE_TNFS_BTN/FP_SOURCE_SD_BTN/FP_ACTIVE_BTN cases below for
+     * how focus is kept (not reset to "nothing") across those toggles now. */
+    edit_ob = FP_NICK_EDIT;
+    next_ob = FP_ROOT;
+    objc_edit(fp_dlg, edit_ob, 0, &idx, ED_INIT);
+
     done = 0;
     while (!done) {
-        /* FP_NICK_EDIT only as the edit object on the FIRST form_do() of
-         * this dialog session (auto-focuses Nickname the instant it
-         * opens) -- every SUBSEQUENT re-entry (after SOURCE_TNFS_BTN/
-         * SOURCE_SD_BTN/FP_ACTIVE_BTN, all EXIT objects that return here
-         * and loop back into another dialog_click()) uses FP_ROOT
-         * instead, same as every other dialog in this file (FE_ROOT/
-         * FS_ROOT). Repeatedly re-passing the SAME edit object across
-         * many form_do() calls on this dialog reproducibly crashed on
-         * real hardware (three bombs) as soon as the user then clicked
-         * into that field -- re-entering edit mode on an object that was
-         * already left in edit mode by a previous form_do() call is not
-         * a pattern any other dialog here relies on. Clicking the
-         * Nickname box by hand still enters edit mode normally either
-         * way -- this only gives up the "already focused" convenience on
-         * the very first frame after a button click. */
-        which = dialog_click(fp_dlg, first_form_do ? FP_NICK_EDIT : FP_ROOT);
-        first_form_do = 0;
+        if (next_ob != FP_ROOT && next_ob != edit_ob && fp_is_editable(next_ob)) {
+            /* Focus moved to a different editable field (Tab/Shift-Tab
+             * via form_keybd(), or a mouse click into one via
+             * form_button()) -- turn the old cursor off, the new one on. */
+            objc_edit(fp_dlg, edit_ob, 0, &idx, ED_END);
+            edit_ob = next_ob;
+            objc_edit(fp_dlg, edit_ob, 0, &idx, ED_INIT);
+        }
+        next_ob = FP_ROOT;
+        which = 0;
+        cont = 1;
+
+        event = evnt_multi(MU_KEYBD | MU_BUTTON,
+                           2, 1, 1,
+                           0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0,
+                           kmsg,
+                           0UL,
+                           &mx, &my, &mb, &ks, &kr, &br);
+
+        if (event & MU_KEYBD) {
+            int scan = (kr >> 8) & 0x00FF;
+            int ascii = kr & 0x00FF;
+
+            if (scan == 0x01 || ascii == 0x1B) {
+                /* Esc: same as [Cancel]. */
+                which = FP_CANCEL;
+            } else if (scan == 0x3B) {
+                /* F1: same as [TNFS] -- swap Source to TNFS. */
+                which = FP_SOURCE_TNFS_BTN;
+            } else if (scan == 0x3C) {
+                /* F2: same as [SD card] -- swap Source to SD card. */
+                which = FP_SOURCE_SD_BTN;
+            } else if (scan == 0x1E && (ks & K_CTRL)) {
+                /* Ctrl+A: same as [Status] -- swap Active <-> Inactive.
+                 * Ctrl, not plain A, so typing an actual "a" into
+                 * Nickname/Host/etc. keeps working normally. */
+                which = FP_ACTIVE_BTN;
+            } else if (scan == 0x13 && (ks & K_CTRL)) {
+                /* Ctrl+R: same as [Remove]. Ctrl, not plain R, for the
+                 * same reason as Ctrl+A above. */
+                which = FP_DELETE;
+            } else {
+                /* Not one of ours -- hand it to AES's own field-editing
+                 * dispatcher (see this function's own header comment). */
+                cont = form_keybd(fp_dlg, edit_ob, next_ob, kr, &next_ob, &kr);
+                if (kr != 0)
+                    objc_edit(fp_dlg, edit_ob, kr, &idx, ED_CHAR);
+                if (!cont)
+                    which = next_ob; /* e.g. Return anywhere activating FP_OK's own DEFAULT flag */
+            }
+        }
+
+        if (event & MU_BUTTON) {
+            obj = objc_find(fp_dlg, FP_ROOT, MAX_DEPTH, mx, my);
+            if (obj > 0) {
+                cont = form_button(fp_dlg, obj, br, &next_ob);
+                if (!cont)
+                    which = next_ob;
+            }
+        }
+
+        if (which == 0)
+            continue; /* nothing to act on this iteration -- e.g. a field just got a character or lost/gained focus */
 
         switch (which) {
         case FP_SOURCE_TNFS_BTN:
             fp_editor_backend = PROFILE_BACKEND_TNFS;
             update_fp_source_buttons();
             fp_apply_backend_visibility();
+            /* Cursor off/on around the redraw, same reasoning as any
+             * field-content-changing redraw needs (see this function's
+             * own header comment on the objc_edit()/form_keybd() pairing)
+             * -- but unlike the original form_do()-based version, focus
+             * is kept on the SAME field instead of being dropped, so the
+             * user can keep typing right after toggling Source without
+             * having to click back into a field. */
+            objc_edit(fp_dlg, edit_ob, 0, &idx, ED_END);
             objc_draw(fp_dlg, FP_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            objc_edit(fp_dlg, edit_ob, 0, &idx, ED_INIT);
             break;
 
         case FP_SOURCE_SD_BTN:
             fp_editor_backend = PROFILE_BACKEND_SD;
             update_fp_source_buttons();
             fp_apply_backend_visibility();
+            objc_edit(fp_dlg, edit_ob, 0, &idx, ED_END);
             objc_draw(fp_dlg, FP_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            objc_edit(fp_dlg, edit_ob, 0, &idx, ED_INIT);
             break;
 
         case FP_ACTIVE_BTN:
             fp_editor_enabled = !fp_editor_enabled;
             update_fp_active_button_text();
+            objc_edit(fp_dlg, edit_ob, 0, &idx, ED_END);
             objc_draw(fp_dlg, FP_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            objc_edit(fp_dlg, edit_ob, 0, &idx, ED_INIT);
             break;
 
         case FP_DELETE:
             if (!is_new) {
-                if (form_alert(1, "[2][Remove this floppy source?][Remove|Cancel]") == 1)
+                objc_edit(fp_dlg, edit_ob, 0, &idx, ED_END);
+                if (form_alert(1, "[2][Remove this floppy source?][Remove|Cancel]") == 1) {
                     done = 2;
+                } else {
+                    objc_edit(fp_dlg, edit_ob, 0, &idx, ED_INIT);
+                }
             }
             break;
 
         case FP_OK:
+            objc_edit(fp_dlg, edit_ob, 0, &idx, ED_END);
             fp_save_to_profile(&working);
             if (!validate_profile(&working, msg)) {
                 form_alert(1, msg);
+                objc_edit(fp_dlg, edit_ob, 0, &idx, ED_INIT);
                 break;
             }
             cfg->profiles[index] = working;
@@ -940,6 +1031,7 @@ static int fp_editor_run(ProfileConfig *cfg, int index)
 
         case FP_CANCEL:
         default:
+            objc_edit(fp_dlg, edit_ob, 0, &idx, ED_END);
             done = 3;
             break;
         }
@@ -1062,35 +1154,131 @@ static void fe_refresh_rows(const ProfileConfig *cfg)
     }
 }
 
+/* Keyboard-navigation highlight for FE_ROW_BTN, same idiom/reasoning as
+ * fs_selected_row/fs_redraw_row above -- FE_ROW_BTN is also a plain
+ * EXIT|TOUCHEXIT button, not SELECTABLE|RBUTTON, so the highlight is a
+ * direct ob_state SELECTED toggle + plain objc_draw(), not
+ * form_button()'s own RBUTTON machinery. */
+static int fe_selected_row = 0;
+
+static void fe_redraw_row(int row)
+{
+    OBJECT *ro = &fe_dlg[FE_ROW_BTN(row)];
+    short x = (short)(fe_dlg[FE_ROOT].ob_x + ro->ob_x);
+    short y = (short)(fe_dlg[FE_ROOT].ob_y + ro->ob_y);
+
+    objc_draw(fe_dlg, FE_ROW_BTN(row), MAX_DEPTH, x, y, ro->ob_width, ro->ob_height);
+}
+
+/* Custom evnt_multi() loop instead of dialog_click()/form_do() -- same
+ * reasoning as server_selector_run()'s own comment: needed for Up/Down
+ * row navigation and the digit/S/Esc keyboard shortcuts below. */
 static void edit_servers_run(ProfileConfig *cfg)
 {
     DialogGeometry geo;
-    short which;
+    short mx, my, mb, ks, kr, br;
+    short msg[8];
+    short event, obj, next, which;
     int done;
-    char msg[220];
+    char save_msg[220];
 
     fe_dialog_init();
     fe_refresh_rows(cfg);
     dialog_open(fe_dlg, FE_ROOT, &geo, 0);
 
+    fe_selected_row = 0;
+    fe_dlg[FE_ROW_BTN(fe_selected_row)].ob_state |= (unsigned short)SELECTED;
+    fe_redraw_row(fe_selected_row);
+
     done = 0;
     while (!done) {
-        which = dialog_click(fe_dlg, FE_ROOT);
+        event = evnt_multi(MU_KEYBD | MU_BUTTON,
+                           2, 1, 1,
+                           0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0,
+                           msg,
+                           0UL,
+                           &mx, &my, &mb, &ks, &kr, &br);
 
-        if (which == FE_SAVE) {
-            perform_save(cfg, msg);
-            form_alert(1, msg);
-        } else if (which >= FE_ROW_BASE && which < FE_AFTER_ROWS) {
-            int obj_offset = which - FE_ROW_BASE;
-            int slot = obj_offset / 2;
-            int is_btn = (obj_offset % 2) == 1;
-            if (is_btn) {
+        if (event & MU_BUTTON) {
+            obj = objc_find(fe_dlg, FE_ROOT, MAX_DEPTH, mx, my);
+            if (obj > 0) {
+                next = obj;
+                if (!form_button(fe_dlg, obj, br, &next)) {
+                    which = (short)(next & 0x7FFF);
+                    if (which == FE_SAVE) {
+                        perform_save(cfg, save_msg);
+                        form_alert(1, save_msg);
+                    } else if (which >= FE_ROW_BASE && which < FE_AFTER_ROWS) {
+                        int obj_offset = which - FE_ROW_BASE;
+                        int slot = obj_offset / 2;
+                        int is_btn = (obj_offset % 2) == 1;
+                        if (is_btn) {
+                            fe_dlg[FE_ROW_BTN(fe_selected_row)].ob_state &= (unsigned short)(~SELECTED);
+                            fe_selected_row = slot;
+                            fp_editor_run(cfg, slot);
+                            fe_refresh_rows(cfg);
+                            fe_dlg[FE_ROW_BTN(fe_selected_row)].ob_state |= (unsigned short)SELECTED;
+                            objc_draw(fe_dlg, FE_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+                        }
+                    } else if (which == FE_OK || which == FE_CANCEL) {
+                        done = 1;
+                    }
+                }
+            }
+        }
+
+        if (event & MU_KEYBD) {
+            int scan = (kr >> 8) & 0x00FF;
+            int ascii = kr & 0x00FF;
+
+            if (scan == 0x48 || scan == 0x50) { /* up / down */
+                int new_row = fe_selected_row;
+
+                if (scan == 0x48) /* up */
+                    new_row = (new_row <= 0) ? 0 : new_row - 1;
+                else /* down */
+                    new_row = (new_row >= MAX_PROFILES - 1) ? MAX_PROFILES - 1 : new_row + 1;
+
+                if (new_row != fe_selected_row) {
+                    fe_dlg[FE_ROW_BTN(fe_selected_row)].ob_state &= (unsigned short)(~SELECTED);
+                    fe_redraw_row(fe_selected_row);
+                    fe_selected_row = new_row;
+                    fe_dlg[FE_ROW_BTN(fe_selected_row)].ob_state |= (unsigned short)SELECTED;
+                    fe_redraw_row(fe_selected_row);
+                }
+            } else if (ascii == ' ' || (ascii >= '1' && ascii <= '8')) {
+                /* Space: same as clicking the highlighted row's own
+                 * Edit/Add button. A digit 1-8 does the same but for
+                 * that specific slot directly, regardless of which row
+                 * is currently highlighted -- moves the highlight there
+                 * too, so a following Up/Down continues from it. Space,
+                 * not Enter: Up/Down already claims the row list, and
+                 * Enter is left free to mean [OK] (below), same as it
+                 * would via plain form_do()'s own DEFAULT-button
+                 * convention -- otherwise OK becomes unreachable from the
+                 * keyboard once a row is highlighted. */
+                int slot = (ascii == ' ') ? fe_selected_row : (ascii - '1');
+
+                fe_dlg[FE_ROW_BTN(fe_selected_row)].ob_state &= (unsigned short)(~SELECTED);
+                fe_selected_row = slot;
                 fp_editor_run(cfg, slot);
                 fe_refresh_rows(cfg);
+                fe_dlg[FE_ROW_BTN(fe_selected_row)].ob_state |= (unsigned short)SELECTED;
                 objc_draw(fe_dlg, FE_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            } else if (scan == 0x1F) {
+                /* S: same as [Save] -- scan code, standard AT/Atari S. */
+                perform_save(cfg, save_msg);
+                form_alert(1, save_msg);
+            } else if (ascii == 0x0D) {
+                /* Enter: same as [OK]. */
+                done = 1;
+            } else if (scan == 0x01 || ascii == 0x1B) {
+                /* Esc: same as [Cancel] -- scan code and ASCII both
+                 * checked, same dual-check convention established
+                 * elsewhere in this file. */
+                done = 1;
             }
-        } else if (which == FE_OK || which == FE_CANCEL) {
-            done = 1;
         }
     }
 
@@ -1184,37 +1372,131 @@ static void fs_refresh_rows(const ProfileConfig *cfg)
     }
 }
 
+/* Keyboard-navigation highlight (Up/Down/Enter, see server_selector_run()'s
+ * own custom event loop) -- distinct from a "click selects" model like
+ * FA_ROW/FM_ROW: FS_ROW is a plain EXIT|TOUCHEXIT button, a single click
+ * already activates it immediately, so this is purely a visual "which row
+ * would Enter/a digit act on" cursor, managed by hand (a direct ob_state
+ * SELECTED toggle + plain objc_draw()) rather than form_button()'s own
+ * RBUTTON-toggle machinery, which only applies to SELECTABLE|RBUTTON
+ * objects like FA_ROW -- FS_ROW is neither. G_BUTTON paints its own full
+ * fill on every objc_draw(), unlike G_STRING, so no v_bar erase-first step
+ * is needed here the way FA_ROW/FM_ROW need one for their own highlight. */
+static int fs_selected_row = 0;
+
+static void fs_redraw_row(int row)
+{
+    OBJECT *ro = &fs_dlg[FS_ROW(row)];
+    short x = (short)(fs_dlg[FS_ROOT].ob_x + ro->ob_x);
+    short y = (short)(fs_dlg[FS_ROOT].ob_y + ro->ob_y);
+
+    objc_draw(fs_dlg, FS_ROW(row), MAX_DEPTH, x, y, ro->ob_width, ro->ob_height);
+}
+
 /* Returns 1 if the user picked a profile (cfg->active_index updated,
  * locally only -- see perform_save()'s own comment on when this actually
  * reaches flash), 2 if the user asked to edit the server list instead
- * (caller then calls edit_servers_run()), 0 if cancelled. */
+ * (caller then calls edit_servers_run()), 0 if cancelled.
+ *
+ * Custom evnt_multi() loop instead of dialog_click()/form_do() -- needed
+ * for Up/Down row navigation and the E/digit-free keyboard shortcuts
+ * below, same reasoning fm_form_do_events()'s own comment gives for why
+ * form_do() alone isn't enough. */
 static int server_selector_run(ProfileConfig *cfg)
 {
     DialogGeometry geo;
-    short which;
+    short mx, my, mb, ks, kr, br;
+    short msg[8];
+    short event, obj, next, which;
     int result = 0;
+    int done = 0;
 
     fs_dialog_init();
     fs_refresh_rows(cfg);
     dialog_open(fs_dlg, FS_ROOT, &geo, 0);
 
-    for (;;) {
-        which = dialog_click(fs_dlg, FS_ROOT);
+    /* Start the highlight on the currently active profile's own row, if
+     * any, so Enter/arrows work immediately without an extra keypress. */
+    fs_selected_row = (cfg->active_index >= 0 && cfg->active_index < MAX_PROFILES) ? cfg->active_index : 0;
+    fs_dlg[FS_ROW(fs_selected_row)].ob_state |= (unsigned short)SELECTED;
+    fs_redraw_row(fs_selected_row);
 
-        if (which >= FS_ROW_BASE && which < FS_AFTER_ROWS) {
-            int slot = which - FS_ROW_BASE;
-            if (profile_slot_is_configured(&cfg->profiles[slot])) {
-                cfg->active_index = slot;
-                favcfg_write_active_slot(slot + 1); /* remembered independently of the firmware's own flash-only active-profile write, see favcfg_write_active_slot()'s own comment */
-                result = 1;
-                break;
+    while (!done) {
+        event = evnt_multi(MU_KEYBD | MU_BUTTON,
+                           2, 1, 1,
+                           0, 0, 0, 0, 0,
+                           0, 0, 0, 0, 0,
+                           msg,
+                           0UL,
+                           &mx, &my, &mb, &ks, &kr, &br);
+
+        if (event & MU_BUTTON) {
+            obj = objc_find(fs_dlg, FS_ROOT, MAX_DEPTH, mx, my);
+            if (obj > 0) {
+                next = obj;
+                if (!form_button(fs_dlg, obj, br, &next)) {
+                    which = (short)(next & 0x7FFF);
+                    if (which >= FS_ROW_BASE && which < FS_AFTER_ROWS) {
+                        int slot = which - FS_ROW_BASE;
+                        if (profile_slot_is_configured(&cfg->profiles[slot])) {
+                            cfg->active_index = slot;
+                            favcfg_write_active_slot(slot + 1); /* remembered independently of the firmware's own flash-only active-profile write, see favcfg_write_active_slot()'s own comment */
+                            result = 1;
+                            done = 1;
+                        }
+                    } else if (which == FS_EDIT) {
+                        result = 2;
+                        done = 1;
+                    } else if (which == FS_CANCEL) {
+                        result = 0;
+                        done = 1;
+                    }
+                }
             }
-        } else if (which == FS_EDIT) {
-            result = 2;
-            break;
-        } else if (which == FS_CANCEL) {
-            result = 0;
-            break;
+        }
+
+        if (event & MU_KEYBD) {
+            int scan = (kr >> 8) & 0x00FF;
+
+            if (scan == 0x48 || scan == 0x50) { /* up / down */
+                int new_row = fs_selected_row;
+
+                if (scan == 0x48) /* up */
+                    new_row = (new_row <= 0) ? 0 : new_row - 1;
+                else /* down */
+                    new_row = (new_row >= MAX_PROFILES - 1) ? MAX_PROFILES - 1 : new_row + 1;
+
+                if (new_row != fs_selected_row) {
+                    fs_dlg[FS_ROW(fs_selected_row)].ob_state &= (unsigned short)(~SELECTED);
+                    fs_redraw_row(fs_selected_row);
+                    fs_selected_row = new_row;
+                    fs_dlg[FS_ROW(fs_selected_row)].ob_state |= (unsigned short)SELECTED;
+                    fs_redraw_row(fs_selected_row);
+                }
+            } else if ((kr & 0x00FF) == 0x0D) {
+                /* Enter: same as clicking the highlighted row -- activates
+                 * it and closes, same as FS_ROW's own EXIT|TOUCHEXIT click.
+                 * A no-op on an empty (DISABLED) slot, matching the mouse's
+                 * own behavior there. */
+                if (profile_slot_is_configured(&cfg->profiles[fs_selected_row])) {
+                    cfg->active_index = fs_selected_row;
+                    favcfg_write_active_slot(fs_selected_row + 1);
+                    result = 1;
+                    done = 1;
+                }
+            } else if (scan == 0x12) {
+                /* E: same as [Edit sources...] -- scan code, standard
+                 * AT/Atari E. */
+                result = 2;
+                done = 1;
+            } else if (scan == 0x01 || (kr & 0x00FF) == 0x1B) {
+                /* Esc: same as [Cancel] -- scan code and ASCII both
+                 * checked, same dual-check convention established
+                 * elsewhere in this file (see fm_form_do_events()'s own
+                 * Esc handling). */
+                result = 0;
+                done = 1;
+            }
         }
     }
 
@@ -1587,9 +1869,10 @@ static void fa_redraw_row(int row)
  * selected slot is empty -- there is nothing to start either way. */
 static void fa_start_selected(void)
 {
-    int slot;
+    int slot, dir_len;
     char name[FAVCFG_NAME_LEN], dir[FAVCFG_DIR_LEN];
-    char msg[300];
+    char path[FAVCFG_DIR_LEN + FAVCFG_NAME_LEN];
+    char msg[100];
 
     if (fa_selected_row < 0)
         return;
@@ -1597,7 +1880,25 @@ static void fa_start_selected(void)
     favcfg_read_entry(fa_mount_slot(), slot + 1, name, sizeof(name), dir, sizeof(dir));
     if (name[0] == '\0')
         return;
-    sprintf(msg, "[1][Now starting:|%-.60s\\%-.60s][OK]", dir, name);
+
+    /* Joined with a forward slash, matching the browse protocol's own
+     * path convention (dir is always "/..."-style, e.g. "/GAMES", never
+     * backslash -- see this function's own history for what went wrong
+     * with "\\" here before) -- and no doubled "//" when dir is already
+     * "/" (root) or otherwise ends with one. */
+    dir_len = (int)strlen(dir);
+    if (dir_len > 0 && dir[dir_len - 1] == '/')
+        sprintf(path, "%s%s", dir, name);
+    else
+        sprintf(path, "%s/%s", dir, name);
+
+    /* The JOINED path, truncated to the same total length this alert
+     * already used safely for a single field before -- a longer combined
+     * dir+name line reproducibly corrupted the alert's own OK button on
+     * real TOS 1.x/2.x hardware (see this function's own history), so
+     * the truncation budget stays the same regardless of which string
+     * fills it. */
+    sprintf(msg, "[1][Now starting:|%-.60s][OK]", path);
     form_alert(1, msg);
 }
 
@@ -2672,6 +2973,89 @@ static int fa_open_browser(ProfileConfig *cfg, int hand_shown)
     return hand_shown;
 }
 
+/* Moves fa_selected_row by one (up=0/down=1), clamped to 0..FA_ROWS-1,
+ * toggling the highlight via form_button() the same way a mouse click on
+ * a row would (see fm_form_do_events()'s own comment on why form_button()
+ * rather than a hand-toggled SELECTED bit). Shared by NORMAL MODE's own
+ * row-selection navigation and PLACE/MOVE MODE's own "which row will
+ * Enter/Space act on" cursor, see fa_complete_place_or_move() below. */
+static void fa_move_selection(int down)
+{
+    int new_row = fa_selected_row;
+
+    if (!down)
+        new_row = (new_row <= 0) ? 0 : new_row - 1;
+    else
+        new_row = (new_row < 0) ? 0 : ((new_row + 1 >= FA_ROWS) ? FA_ROWS - 1 : new_row + 1);
+
+    if (new_row != fa_selected_row) {
+        short next = (short)FA_ROW(new_row);
+        form_button(fa_dlg, FA_ROW(new_row), 1, &next);
+        fa_selected_row = new_row;
+    }
+}
+
+/* Completes PLACE or MOVE MODE by acting on `row` (0..FA_ROWS-1, on the
+ * currently displayed page) -- shared by the mouse-click path
+ * (dialog_run()'s own MU_BUTTON handling, via fa_row_at()) and the
+ * keyboard path (Up/Down + Enter/Space, see dialog_run()'s own MU_KEYBD
+ * handling below), so a favorite can be placed or moved with the
+ * keyboard alone, no mouse required. Caller is responsible for checking
+ * fa_mode is actually PLACE or MOVE and row is valid first -- this
+ * always ends whichever mode was active. */
+static void fa_complete_place_or_move(int row)
+{
+    int slot = fa_current_page * FA_ROWS + row;
+
+    /* Busy cursor for the whole place/move -- favcfg_write_entry()/
+     * favcfg_move_entry() below do real file I/O (a streaming rewrite of
+     * MOUNTn.CFG), which this session's own testing has shown can take a
+     * noticeable moment on a TNFS-backed drive. Restored to ARROW once,
+     * at the very end, regardless of which branch ran below. */
+    graf_mouse(BUSY_BEE, 0L);
+
+    if (fa_mode == FAVORITES_MODE_PLACE) {
+        /* Persists immediately -- a streaming rewrite of this mount's own
+         * MOUNTn.CFG, see favcfg_write_entry(). No separate Save step
+         * exists anywhere in this app. */
+        favcfg_write_entry(fa_mount_slot(), slot + 1, fa_place_name, fa_place_dir);
+        fa_refresh_rows();
+        fa_redraw_row(row); /* only this one row changed -- see fa_redraw_row()'s own comment on why a plain objc_draw() of just the row isn't enough by itself */
+
+        /* Leave PLACE MODE, keep the dialog open with the new filename
+         * visible -- exactly this task's own "AFTER PLACEMENT" contract.
+         * Replacing an already-occupied slot needs no extra confirmation
+         * step, also per this task's own brief. */
+        fa_mode = FAVORITES_MODE_NORMAL;
+        fa_place_name[0] = '\0';
+        fa_place_dir[0] = '\0';
+    } else if (fa_mode == FAVORITES_MODE_MOVE) {
+        /* Same slot chosen again: a no-op move, but still ends MOVE
+         * MODE -- confirming any row always completes the gesture one
+         * way or another, same as PLACE MODE. */
+        if (slot != fa_move_source_slot) {
+            int source_page = fa_move_source_slot / FA_ROWS;
+            int source_row = fa_move_source_slot % FA_ROWS;
+
+            /* A true swap, not a one-way overwrite -- if the destination
+             * already held a favorite, it moves to the source slot
+             * rather than being lost (see favcfg_move_entry()'s own
+             * comment). Persists immediately, same as Place/Erase. */
+            favcfg_move_entry(fa_mount_slot(), fa_move_source_slot + 1, slot + 1);
+
+            fa_refresh_rows(); /* current page only -- rebuilds fa_row_text[]/tab highlight from MOUNTn.CFG */
+            fa_redraw_row(row); /* destination -- always on the current page */
+            if (source_page == fa_current_page)
+                fa_redraw_row(source_row); /* source also visible on this same page -- redraw it too */
+        }
+
+        fa_mode = FAVORITES_MODE_NORMAL;
+        fa_move_source_slot = -1;
+    }
+
+    graf_mouse(ARROW, 0L);
+}
+
 /* Opens the server/source selector -- server_selector_run() (and
  * edit_servers_run() if that returns "edit") -- shared with the
  * browser's own former [Source] button, now moved here (FA_SOURCE_BTN,
@@ -2816,57 +3200,10 @@ void dialog_run(ProfileConfig *cfg)
         if (event & MU_BUTTON) {
             int placed = 0;
 
-            if (fa_mode == FAVORITES_MODE_PLACE) {
+            if (fa_mode == FAVORITES_MODE_PLACE || fa_mode == FAVORITES_MODE_MOVE) {
                 int row = fa_row_at(mx, my);
                 if (row >= 0) {
-                    int slot = fa_current_page * FA_ROWS + row;
-
-                    /* Persists immediately -- a streaming rewrite of this
-                     * mount's own MOUNTn.CFG, see favcfg_write_entry(). No
-                     * separate Save step exists anywhere in this app. */
-                    favcfg_write_entry(fa_mount_slot(), slot + 1, fa_place_name, fa_place_dir);
-                    fa_refresh_rows();
-                    fa_redraw_row(row); /* only this one row changed -- see fa_redraw_row()'s own comment on why a plain objc_draw() of just the row isn't enough by itself */
-
-                    /* Leave PLACE MODE, restore ARROW, keep the dialog
-                     * open with the new filename visible -- exactly this
-                     * task's own "AFTER PLACEMENT" contract. Replacing an
-                     * already-occupied slot needs no extra confirmation
-                     * step, also per this task's own brief. */
-                    fa_mode = FAVORITES_MODE_NORMAL;
-                    fa_place_name[0] = '\0';
-                    fa_place_dir[0] = '\0';
-                    graf_mouse(ARROW, 0L);
-                    placed = 1;
-                }
-            } else if (fa_mode == FAVORITES_MODE_MOVE) {
-                int row = fa_row_at(mx, my);
-                if (row >= 0) {
-                    int dest_slot = fa_current_page * FA_ROWS + row;
-
-                    /* Same slot clicked again: a no-op move, but still
-                     * ends MOVE MODE -- clicking any row always completes
-                     * the gesture one way or another, same as PLACE MODE. */
-                    if (dest_slot != fa_move_source_slot) {
-                        int source_page = fa_move_source_slot / FA_ROWS;
-                        int source_row = fa_move_source_slot % FA_ROWS;
-
-                        /* A true swap, not a one-way overwrite -- if the
-                         * destination already held a favorite, it moves
-                         * to the source slot rather than being lost (see
-                         * favcfg_move_entry()'s own comment). Persists
-                         * immediately, same as Place/Erase. */
-                        favcfg_move_entry(fa_mount_slot(), fa_move_source_slot + 1, dest_slot + 1);
-
-                        fa_refresh_rows(); /* current page only -- rebuilds fa_row_text[]/tab highlight from MOUNTn.CFG */
-                        fa_redraw_row(row); /* destination -- always on the current page */
-                        if (source_page == fa_current_page)
-                            fa_redraw_row(source_row); /* source also visible on this same page -- redraw it too */
-                    }
-
-                    fa_mode = FAVORITES_MODE_NORMAL;
-                    fa_move_source_slot = -1;
-                    graf_mouse(ARROW, 0L);
+                    fa_complete_place_or_move(row);
                     placed = 1;
                 }
             }
@@ -2941,6 +3278,29 @@ void dialog_run(ProfileConfig *cfg)
                  * Tab) and ASCII (0x09) both checked, same dual-check
                  * convention Esc already established. */
                 hand_shown = fa_open_browser(cfg, hand_shown);
+            } else if ((scan == 0x01 || (kr & 0x00FF) == 0x1B) && fa_mode != FAVORITES_MODE_NORMAL) {
+                /* Esc while PLACE/MOVE MODE is armed (FLAT_HAND showing):
+                 * cancel it and go back to plain ARROW/NORMAL MODE,
+                 * without opening the browser the way Tab's own cancel
+                 * does. Checked here, mode-independently, rather than
+                 * folded into the NORMAL-MODE-only Esc/deselect handling
+                 * further down -- that one only ever runs once fa_mode is
+                 * already NORMAL, so it could never have caught this. */
+                fa_mode = FAVORITES_MODE_NORMAL;
+                fa_place_name[0] = '\0';
+                fa_place_dir[0] = '\0';
+                fa_move_source_slot = -1;
+                graf_mouse(ARROW, 0L);
+                hand_shown = 0;
+                /* Also clear the keyboard-navigation row highlight, if
+                 * Up/Down was used to pick a target before cancelling --
+                 * see fa_move_selection()'s own comment on why PLACE/MOVE
+                 * MODE reuses fa_selected_row for this. */
+                if (fa_selected_row >= 0) {
+                    fa_dlg[FA_ROW(fa_selected_row)].ob_state &= (unsigned short)(~SELECTED);
+                    fa_redraw_row(fa_selected_row);
+                    fa_selected_row = -1;
+                }
             } else if (scan == 0x1F) {
                 /* S: same as [Source] -- scan code, standard AT/Atari S,
                  * same shortcut the browser's own former [Source] button
@@ -2969,24 +3329,11 @@ void dialog_run(ProfileConfig *cfg)
                 }
             } else if (fa_mode == FAVORITES_MODE_NORMAL) {
                 /* Row-selection-dependent shortcuts, NORMAL MODE only --
-                 * in PLACE/MOVE MODE there is no selection concept, only
-                 * a pending action waiting for a row click. */
+                 * PLACE/MOVE MODE has its own equivalent below, since
+                 * there Up/Down/Enter act on the pending placement/move
+                 * instead of a plain selection. */
                 if (scan == 0x48 || scan == 0x50) { /* up / down */
-                    int new_row = fa_selected_row;
-
-                    if (scan == 0x48) /* up */
-                        new_row = (new_row <= 0) ? 0 : new_row - 1;
-                    else /* down */
-                        new_row = (new_row < 0) ? 0 : ((new_row + 1 >= FA_ROWS) ? FA_ROWS - 1 : new_row + 1);
-
-                    /* Let form_button() do the highlight toggle -- same
-                     * call the mouse-click path relies on, see
-                     * fm_form_do_events()'s own comment on why. */
-                    if (new_row != fa_selected_row) {
-                        short next = (short)FA_ROW(new_row);
-                        form_button(fa_dlg, FA_ROW(new_row), 1, &next);
-                        fa_selected_row = new_row;
-                    }
+                    fa_move_selection(scan == 0x50);
                 } else if ((kr & 0x00FF) == 0x0D) {
                     /* Return/Enter on a selected favorite: same outcome as
                      * a double-click on it -- see fa_start_selected()'s
@@ -3012,6 +3359,22 @@ void dialog_run(ProfileConfig *cfg)
                      * -- see fm_form_do_events()'s own comment on this
                      * same check. */
                     fa_deselect();
+                }
+            } else {
+                /* PLACE or MOVE MODE: Up/Down move the SAME fa_selected_row
+                 * cursor NORMAL MODE uses (reusing fa_move_selection()), and
+                 * Enter/Space confirm placing/moving onto whichever row is
+                 * currently highlighted -- an alternative to clicking a row
+                 * with the FLAT_HAND mouse cursor, not a replacement for it
+                 * (the mouse path above still works exactly as before). A
+                 * no-op with nothing highlighted yet (fa_selected_row still
+                 * -1, e.g. the very first keypress after arming PLACE/MOVE
+                 * MODE) -- press Up/Down at least once first. */
+                if (scan == 0x48 || scan == 0x50) { /* up / down */
+                    fa_move_selection(scan == 0x50);
+                } else if ((kr & 0x00FF) == 0x0D || (kr & 0x00FF) == 0x20) {
+                    if (fa_selected_row >= 0)
+                        fa_complete_place_or_move(fa_selected_row);
                 }
             }
         }
