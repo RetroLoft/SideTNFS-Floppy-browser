@@ -19,7 +19,13 @@
 
 #define PROFILE_NICK_LEN  24  /* 23 chars + NUL, matches SIDETNFS_FLOPPY_NICKNAME_LEN */
 #define PROFILE_HOST_LEN  64  /* 63 chars + NUL, matches SIDETNFS_FLOPPY_HOST_LEN -- TNFS only */
-#define PROFILE_MOUNT_LEN 32  /* 31 chars + NUL, matches SIDETNFS_FLOPPY_MOUNTPATH_LEN -- TNFS only */
+/* Architecture change: TNFS sources always mount the server root now
+ * (fixed firmware behavior, no longer configurable) -- this field used to
+ * be a short TNFS mount POINT (SIDETNFS_FLOPPY_MOUNTPATH_LEN, 32 chars),
+ * it is now the Browser's configured START DIRECTORY under that root,
+ * which can be just as deep as an SD path -- widened to match
+ * PROFILE_SDPATH_LEN rather than keeping the old short cap. */
+#define PROFILE_STARTDIR_LEN 256
 #define PROFILE_SDPATH_LEN 256 /* matches SIDETNFS_FLOPPY_SDPATH_LEN -- SD only, full path */
 #define PROFILE_LASTDIR_LEN 256 /* matches SIDETNFS_FLOPPY_LASTDIR_LEN -- application
                                   * state, not directly editable in the profile editor */
@@ -50,10 +56,14 @@ typedef struct {
     char nickname[PROFILE_NICK_LEN];
     char last_directory[PROFILE_LASTDIR_LEN]; /* common to both backends */
 
-    /* TNFS only -- meaningless/blank when backend == PROFILE_BACKEND_SD */
+    /* TNFS only -- meaningless/blank when backend == PROFILE_BACKEND_SD.
+     * browser_start_dir: the Browser's configured starting directory,
+     * relative to the TNFS server root (which is always what gets
+     * mounted now -- see PROFILE_STARTDIR_LEN's own comment). Was called
+     * mount_path when it was a real, separately-mounted TNFS path. */
     char host[PROFILE_HOST_LEN];
     int  port;
-    char mount_path[PROFILE_MOUNT_LEN];
+    char browser_start_dir[PROFILE_STARTDIR_LEN];
 
     /* SD only -- meaningless/blank when backend == PROFILE_BACKEND_TNFS */
     char sd_path[PROFILE_SDPATH_LEN];
