@@ -1,5 +1,8 @@
 # FLOPPY.PRG
 
+> [!IMPORTANT]
+> SideTNFS-Floppy-browser is part of the [SideTNFS](https://github.com/RetroLoft/SideTNFS-Firmware) project.
+
 FLOPPY.PRG is the floppy-image browser and launcher for
 [SideTNFS](https://github.com/RetroLoft/SideTNFS-Firmware) on the Atari ST family.
 
@@ -14,13 +17,14 @@ be renamed to Atari GEMDOS 8.3 filenames.
 
 - Browse `.ST` floppy images on microSD or TNFS network servers
 - Full long-filename browsing
-- Up to 8 configurable browser sources
+- Up to 8 configurable TNFS or SD sources
 - Search within the current directory
-- Up to 60 persistent Favorites
+- Up to 60 Favorite slots for your most favorite floppy images
 - Temporary Carousel for multi-disk games
 - Carousel entries may come from different SD or TNFS sources
 - Switch to the next floppy with the SideTNFS SELECT button
 - Start a single floppy immediately without manually building a Carousel
+- Emulates drive A: or B:
 - Optional simultaneous use of SideTNFS SD/TNFS GEMDOS drives
 - Keyboard and mouse operation
 
@@ -234,3 +238,17 @@ make clean
 
 Copy `FLOPPY.PRG` to your Atari ST and run it from the GEM Desktop while the
 SideTNFS cartridge is installed.
+
+## Known limitations
+
+- Only `.ST` disk images are supported. Other floppy image formats (`.STX`,
+  `.MSA`, `.DIM`, ...) are not read.
+- Floppy emulation works through the GEMDOS file system vectors. Some games
+  and other software bypass GEMDOS entirely -- custom loaders, copy
+  protection, or direct floppy controller access -- and will not work
+  correctly, or at all, under this kind of emulation.
+- Medium or high resolution is required. On a low-resolution screen,
+  FLOPPY.PRG shows an explanatory message and exits.
+- Only one virtual floppy drive is active at a time: A: or B:, never both
+  simultaneously.
+- TNFS sources are reached over UDP only; TCP is not supported.
