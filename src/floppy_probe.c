@@ -424,9 +424,13 @@ int floppy_probe_browse_get_page(unsigned long generation, unsigned long page_in
 
 /* SESSION_START request payload: backend(2) + port(2) + host
  * (FLOPPY_HOST_LEN=64) + install_gemdrive(2) + install_floppy(2) +
- * image_path(FLOPPY_SESSION_IMAGE_PATH_MAX=512) = 584 bytes, comfortably
- * under the 2112-byte payload cap. This is the FIRST Carousel entry's
- * own descriptor sent inline -- there is no more session-wide
+ * drive_number(2) + image_path(FLOPPY_SESSION_IMAGE_PATH_MAX=512) = 586
+ * bytes, comfortably under the 2112-byte payload cap. drive_number (0 =
+ * drive A:, 1 = drive B:) is the newest field, inserted right after
+ * install_floppy and before image_path -- matches SideTNFS-Firmware's own
+ * updated GEMDRVEMUL_FLOPPY_SESSION_START layout exactly (drive A:/B:
+ * selection, coordinated with that repo). This is the FIRST Carousel
+ * entry's own descriptor sent inline -- there is no more session-wide
  * "active_slot" on the firmware side at all (GEMDRVEMUL_FLOPPY_
  * SESSION_ACTIVE_SLOT is removed from the ROM3 layout entirely per the
  * architecture change, not just unused). No leading header/skip words --
@@ -434,7 +438,7 @@ int floppy_probe_browse_get_page(unsigned long generation, unsigned long page_in
  * against this file's own existing (pre-change) SESSION_START, which
  * never had one either. */
 #define SESSION_START_PAYLOAD_BYTES \
-    (2UL + 2UL + (unsigned long)FLOPPY_HOST_LEN + 2UL + 2UL + (unsigned long)FLOPPY_SESSION_IMAGE_PATH_MAX)
+    (2UL + 2UL + (unsigned long)FLOPPY_HOST_LEN + 2UL + 2UL + 2UL + (unsigned long)FLOPPY_SESSION_IMAGE_PATH_MAX)
 
 /* Sends len (must be even) bytes from data as a raw byte blob -- same
  * wire shape send_string_field() already uses (two source bytes packed
@@ -563,7 +567,7 @@ int floppy_probe_favorites_upload(const FavcfgSession *session, unsigned long *o
 }
 
 int floppy_probe_session_start(const FloppySourceDescriptor *src, const char *image_path,
-                                 int install_gemdrive, int install_floppy,
+                                 int install_gemdrive, int install_floppy, int drive_number,
                                  FloppySessionResult *out)
 {
     char host_buf[FLOPPY_HOST_LEN];
@@ -579,6 +583,7 @@ int floppy_probe_session_start(const FloppySourceDescriptor *src, const char *im
     send_string_field(host_buf, FLOPPY_HOST_LEN);
     send_param16(install_gemdrive ? 1UL : 0UL);
     send_param16(install_floppy ? 1UL : 0UL);
+    send_param16(drive_number ? 1UL : 0UL); /* 0 = drive A: (default), 1 = drive B: */
     send_string_field(path_buf, FLOPPY_SESSION_IMAGE_PATH_MAX);
 
     /* SESSION_START may need real network/backend I/O (TNFS mount, sector

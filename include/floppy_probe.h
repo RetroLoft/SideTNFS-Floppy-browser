@@ -208,12 +208,15 @@ int floppy_probe_favorites_upload(const FavcfgSession *session, unsigned long *o
  * commands.h -- INSTALL_FLOPPY=NO does not require or validate an image),
  * so an empty string is fine in that case (src is still required even
  * then, matching the firmware's own new self-contained-per-entry design).
- * Returns FLOPPY_PROBE_OK/_TIMEOUT for the transport result; out->status/
- * geometry are only meaningful when this itself returns FLOPPY_PROBE_OK.
- * This command does not reset the Atari -- the caller decides
- * whether/when to do that based on out->status. */
+ * drive_number selects which GEMDOS drive the floppy is installed as: 0 =
+ * drive A: (the default -- every caller except the Start-options dialog's
+ * own [Drive B:] choice always passes 0), 1 = drive B:, exclusive (never
+ * both). Returns FLOPPY_PROBE_OK/_TIMEOUT for the transport result;
+ * out->status/geometry are only meaningful when this itself returns
+ * FLOPPY_PROBE_OK. This command does not reset the Atari -- the caller
+ * decides whether/when to do that based on out->status. */
 int floppy_probe_session_start(const FloppySourceDescriptor *src, const char *image_path,
-                                 int install_gemdrive, int install_floppy,
+                                 int install_gemdrive, int install_floppy, int drive_number,
                                  FloppySessionResult *out);
 
 #endif

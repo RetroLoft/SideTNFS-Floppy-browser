@@ -1989,10 +1989,11 @@ static int fa_build_carousel_session(FavcfgSession *out)
 /* Start options (FSO_*)                                               */
 /* Phase 7 -- lets the user choose Floppy-only vs a combined GEMDRIVE+ */
 /* Floppy install right before Start actually uploads the Carousel and */
-/* resets. Also shows a Drive A:/B: choice, but B: is a UI-only         */
-/* placeholder for this phase -- see FSO_DRIVE_B_BTN's own comment; no */
-/* protocol/BIOS-hook/BPB/drive-number work exists for it yet, only A: */
-/* is real.                                                             */
+/* resets. Also shows a Drive A:/B: choice -- exclusive, never both --  */
+/* which GEMDRVEMUL_FLOPPY_SESSION_START's own drive_number field now  */
+/* carries end to end (floppy_probe_session_start()'s own comment).    */
+/* Always defaults to A: every time this dialog opens (see fso_drive's */
+/* own comment) -- the user must explicitly pick B: here each time.    */
 /*                                                                      */
 /* Carousel task -- shows the 8 Carousel slots directly under the      */
 /* title (read-only display here; slots are populated elsewhere, by    */
@@ -2050,6 +2051,26 @@ static void fso_update_mode_buttons(void)
     } else {
         fso_dlg[FSO_MODE_FLOPPY_BTN].ob_state |= (unsigned short)SELECTED;
         fso_dlg[FSO_MODE_COMBINED_BTN].ob_state &= (unsigned short)(~SELECTED);
+    }
+}
+
+/* 0 = drive A: (the default), 1 = drive B: -- live UI state only, reset
+ * to 0 every time fa_start_options_run() opens, same "no persisted
+ * memory across Starts" reasoning fso_mode's own comment gives -- per
+ * Frank's own brief, the user must explicitly pick B: here each time,
+ * every other Start path (FA_START_BTN/FM_START_BTN via this dialog's
+ * own default, and [Start now] which skips this dialog entirely) always
+ * means A:. */
+static int fso_drive;
+
+static void fso_update_drive_buttons(void)
+{
+    if (fso_drive) {
+        fso_dlg[FSO_DRIVE_B_BTN].ob_state |= (unsigned short)SELECTED;
+        fso_dlg[FSO_DRIVE_A_BTN].ob_state &= (unsigned short)(~SELECTED);
+    } else {
+        fso_dlg[FSO_DRIVE_A_BTN].ob_state |= (unsigned short)SELECTED;
+        fso_dlg[FSO_DRIVE_B_BTN].ob_state &= (unsigned short)(~SELECTED);
     }
 }
 
@@ -2132,21 +2153,18 @@ static void fso_dialog_init(void)
     set_obj(fso_dlg, FSO_LBL_DRIVE, G_STRING, NONE, NORMAL, xl, ylbl2, 30*lm.cw, lm.rh);
     fso_dlg[FSO_LBL_DRIVE].ob_spec.free_string = "On which drive to install?";
 
+    /* Both live buttons now -- same SELECTED-pair radio idiom
+     * fso_mode/fso_update_mode_buttons() already use for the Floppy-only/
+     * Combined toggle just above, driven by fso_drive/
+     * fso_update_drive_buttons(). Real state initialized by
+     * fa_start_options_run() (fso_drive = 0, then
+     * fso_update_drive_buttons()) right after this dialog opens -- the
+     * SELECTED flag set here is only ever the very first paint's own
+     * starting point. */
     set_obj(fso_dlg, FSO_DRIVE_A_BTN, G_BUTTON, EXIT | TOUCHEXIT, SELECTED, xl, ybtn2, 11*lm.cw, lm.rh);
     fso_dlg[FSO_DRIVE_A_BTN].ob_spec.free_string = " Drive A:  ";
 
-    /* Drive B: -- UI placeholder only (Phase 7 explicitly excludes real
-     * Drive B floppy emulation -- no protocol/BIOS-hook/BPB/drive-number
-     * work exists for it). Plain G_BUTTON with NO EXIT/TOUCHEXIT flag,
-     * DISABLED state: visibly present (honest that the option exists in
-     * the design) but genuinely inert -- it can never complete a click
-     * the way an EXIT|TOUCHEXIT button could, unlike the empty-slot
-     * DISABLED buttons elsewhere in this file (FS_ROW, FP_DELETE), which
-     * still need an app-level guard because they keep their EXIT flag.
-     * Drive A: stays permanently SELECTED (set above) since it is the
-     * only real choice right now; no click handling exists for either
-     * drive button in fa_start_options_run() below. */
-    set_obj(fso_dlg, FSO_DRIVE_B_BTN, G_BUTTON, NONE, DISABLED, xl + 12*lm.cw, ybtn2, 11*lm.cw, lm.rh);
+    set_obj(fso_dlg, FSO_DRIVE_B_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, xl + 12*lm.cw, ybtn2, 11*lm.cw, lm.rh);
     fso_dlg[FSO_DRIVE_B_BTN].ob_spec.free_string = " Drive B:  ";
 
     set_obj(fso_dlg, FSO_DIV3, G_BOX, NONE, NORMAL, lm.cw, ydiv3, DW - 2*lm.cw, 2);
@@ -2169,14 +2187,16 @@ static void fso_dialog_init(void)
 
 /* Runs the Phase 7 Start-options dialog. Returns 1 if Reboot was chosen
  * (*out_install_gemdrive set to 0 = Floppy only / 1 = with SD/TNFS
- * drives), 0 if Cancel or Esc (*out_install_gemdrive left untouched --
- * caller must not act on it, and must make no flag/session change and no
- * reboot). Deliberately resets to Floppy only/Drive A: every time it
- * opens rather than remembering the last choice, and never writes either
- * choice to CONFIG.CFG -- the brief for this phase asks for a fresh
- * choice on every Start, unlike e.g. favcfg_read_active_slot()'s own
- * "remember across restarts" behavior for the Source picker. */
-static int fa_start_options_run(int *out_install_gemdrive)
+ * drives; *out_drive_number set to 0 = drive A: / 1 = drive B:), 0 if
+ * Cancel or Esc (*out_install_gemdrive and *out_drive_number left
+ * untouched -- caller must not act on either, and must make no flag/
+ * session change and no reboot). Deliberately resets to Floppy only/
+ * Drive A: every time it opens rather than remembering the last choice,
+ * and never writes either choice to CONFIG.CFG -- the brief for this
+ * phase asks for a fresh choice on every Start, unlike e.g.
+ * favcfg_read_active_slot()'s own "remember across restarts" behavior
+ * for the Source picker. */
+static int fa_start_options_run(int *out_install_gemdrive, int *out_drive_number)
 {
     DialogGeometry geo;
     short mx, my, mb, ks, kr, br;
@@ -2185,10 +2205,12 @@ static int fa_start_options_run(int *out_install_gemdrive)
     int result = 0;
     int done = 0;
 
-    fso_mode = 0; /* Floppy only, every time -- see this function's own header comment */
+    fso_mode = 0;  /* Floppy only, every time -- see this function's own header comment */
+    fso_drive = 0; /* Drive A:, every time -- same reasoning */
     fso_dialog_init();
     fso_refresh_carousel_rows();
     fso_update_mode_buttons();
+    fso_update_drive_buttons();
     /* Always centered, unlike the FA_ and FM_ full-screen "hub" windows --
      * this is a small popup dialog, same convention FS_/FE_/FP_ use
      * (dialog_open(..., 0) unconditionally). An earlier version of this
@@ -2236,6 +2258,10 @@ static int fa_start_options_run(int *out_install_gemdrive)
                 which = FSO_MODE_COMBINED_BTN;
             else if (scan == 0x12) /* E: same as [Empty] -- scan code, standard AT/Atari E */
                 which = FSO_EMPTY;
+            else if (scan == 0x1E) /* A: same as [Drive A:] -- scan code, standard AT/Atari A */
+                which = FSO_DRIVE_A_BTN;
+            else if (scan == 0x30) /* B: same as [Drive B:] -- scan code, standard AT/Atari B */
+                which = FSO_DRIVE_B_BTN;
         }
 
         switch (which) {
@@ -2251,8 +2277,21 @@ static int fa_start_options_run(int *out_install_gemdrive)
             objc_draw(fso_dlg, FSO_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
             break;
 
+        case FSO_DRIVE_A_BTN:
+            fso_drive = 0;
+            fso_update_drive_buttons();
+            objc_draw(fso_dlg, FSO_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            break;
+
+        case FSO_DRIVE_B_BTN:
+            fso_drive = 1;
+            fso_update_drive_buttons();
+            objc_draw(fso_dlg, FSO_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+            break;
+
         case FSO_REBOOT:
             *out_install_gemdrive = fso_mode;
+            *out_drive_number = fso_drive;
             result = 1;
             done = 1;
             break;
@@ -2369,11 +2408,13 @@ static int fa_start_prepare_session(void)
 }
 
 /* Uploads fa_start_session (already built by fa_start_prepare_session())
- * and starts it with the given install_gemdrive mode -> reset, or shows
- * an alert and stays in FLOPPY.PRG on any failure. Shared tail end of
- * both fa_start_selected() (mode chosen via the Start-options dialog) and
- * fa_start_now() (mode fixed at "Floppy only" -- see its own comment). */
-static void fa_start_with_mode(int install_gemdrive)
+ * and starts it with the given install_gemdrive mode and drive_number (0
+ * = drive A:, 1 = drive B:) -> reset, or shows an alert and stays in
+ * FLOPPY.PRG on any failure. Shared tail end of both fa_start_selected()
+ * (both values chosen via the Start-options dialog) and fa_start_now()
+ * (mode fixed at "Floppy only", drive fixed at A: -- see its own
+ * comment). */
+static void fa_start_with_mode(int install_gemdrive, int drive_number)
 {
     char msg[200];
     unsigned long fav_status, probe_rc;
@@ -2415,7 +2456,7 @@ static void fa_start_with_mode(int install_gemdrive)
 
         probe_rc = (unsigned long)floppy_probe_session_start(
             &src, fa_start_session.strings + first->path_offset,
-            install_gemdrive, install_floppy, &session_result);
+            install_gemdrive, install_floppy, drive_number, &session_result);
     }
     graf_mouse(ARROW, 0L);
 
@@ -2448,15 +2489,15 @@ static void fa_start_with_mode(int install_gemdrive)
  * fa_start_options_run() already alert/no-op appropriately themselves. */
 static void fa_start_selected(void)
 {
-    int install_gemdrive;
+    int install_gemdrive, drive_number;
 
     if (!fa_start_prepare_session())
         return;
 
-    if (!fa_start_options_run(&install_gemdrive))
+    if (!fa_start_options_run(&install_gemdrive, &drive_number))
         return; /* Cancel/Esc -- no flag/session change, no reboot */
 
-    fa_start_with_mode(install_gemdrive);
+    fa_start_with_mode(install_gemdrive, drive_number);
 }
 
 /* [Start now] on the "Added to the Carousel" alert -- "direct resetten en
@@ -2479,7 +2520,11 @@ static void fa_start_selected(void)
  * should boot straight into that second game, not silently jump back to
  * the first one just because it happens to sit in an earlier slot. Pass 0
  * to keep fa_build_carousel_session()'s own default (unused today, kept
- * for callers with no one particular slot in mind). */
+ * for callers with no one particular slot in mind).
+ *
+ * Always drive A: -- per Frank's own brief, only the full Start-options
+ * dialog ([Carousel]/[Start] elsewhere) offers a B: choice; this shortcut
+ * stays A-only. */
 static void fa_start_now(int just_added_slot)
 {
     if (!fa_start_prepare_session())
@@ -2488,7 +2533,7 @@ static void fa_start_now(int just_added_slot)
     if (just_added_slot >= 1 && just_added_slot <= FA_CAROUSEL_SLOTS)
         fa_start_session.active_index = (unsigned int)(just_added_slot - 1);
 
-    fa_start_with_mode(0); /* Floppy only */
+    fa_start_with_mode(0, 0); /* Floppy only, drive A: */
 }
 
 /* Empties the currently selected favorite slot -- "Erase", not "Delete":

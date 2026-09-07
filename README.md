@@ -172,7 +172,11 @@ run by itself or together with the normal SideTNFS GEMDOS drives.
 **With SD/TNFS drives** keeps the configured SideTNFS GEMDOS drives available
 as well.
 
-The virtual floppy is normally installed as drive A:.
+The same dialog also lets you choose which drive letter the virtual floppy
+is installed as: **A:** (the default) or **B:**, never both at once. B:
+must be picked explicitly every time you start the Carousel -- it is never
+remembered between runs. **Start Now** always uses drive A:; only the full
+Start Floppy Carousel dialog offers B:.
 
 ## Keyboard use
 
