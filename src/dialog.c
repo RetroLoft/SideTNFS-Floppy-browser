@@ -2230,6 +2230,12 @@ static int fa_start_options_run(int *out_install_gemdrive)
                 which = FSO_CANCEL;
             else if (ascii == 0x0D) /* Return: same as [Reboot], FSO_REBOOT's own DEFAULT flag */
                 which = FSO_REBOOT;
+            else if (scan == 0x3B) /* F1: same as [Floppy only] -- same F1/F2 toggle idiom fp_editor_run()'s own Source toggle uses */
+                which = FSO_MODE_FLOPPY_BTN;
+            else if (scan == 0x3C) /* F2: same as [With SD/TNFS drives] */
+                which = FSO_MODE_COMBINED_BTN;
+            else if (scan == 0x12) /* E: same as [Empty] -- scan code, standard AT/Atari E */
+                which = FSO_EMPTY;
         }
 
         switch (which) {
@@ -2286,7 +2292,11 @@ static int fa_start_options_run(int *out_install_gemdrive)
  * fa_start_selected() below), not tied to any one selected row. No-op if
  * nothing is selected, or the selected slot is empty -- there is nothing
  * to add either way. */
-static void fa_start_selected(void); /* forward declaration -- defined just below, but the [Carousel] jump-to-Start button (this function's own body) needs to call it first */
+/* Forward declarations -- both defined further below, but the [Carousel]/
+ * [Start now] buttons on this function's own "Added to the Carousel"
+ * alert need to call them first. */
+static void fa_start_selected(void);
+static void fa_start_now(int just_added_slot);
 static void fa_add_selected_to_carousel(void)
 {
     int slot, favorite_number, carousel_slot;
@@ -2303,22 +2313,32 @@ static void fa_add_selected_to_carousel(void)
 
     carousel_slot = fa_carousel_add(&rec);
     if (carousel_slot > 0) {
-        /* [Carousel] jumps straight into the same Start flow FA_START_BTN
-         * itself triggers (fa_start_selected() -- shows the 8 slots,
-         * asks install mode, uploads+reboots on confirm) -- "OK" (button
-         * 1, the default, so a quick Enter/click behaves exactly as
-         * before this button was added) just dismisses. Own redraw of
-         * FA_ROOT after a [Carousel] round that returns here (Cancelled,
-         * or a failure alert) rather than resetting -- fa_start_selected()
-         * opens a raw form_dial()-based dialog (fa_start_options_run()),
-         * which does not restore the screen under it on its own, unlike
-         * form_alert() itself (see dialog_close()'s own comment
-         * elsewhere in this file). */
-        sprintf(msg, "[1][Added to the Carousel|(slot %d of %d).][OK|Carousel]", carousel_slot, FA_CAROUSEL_SLOTS);
-        if (form_alert(1, msg) == 2) {
+        int alert_result;
+
+        /* [Carousel] (the default button -- form_alert()'s own 1st
+         * argument) jumps into the full Start flow (fa_start_selected()
+         * -- shows the 8 slots, asks Floppy-only/Combined, uploads+
+         * reboots on confirm). [Start now] skips straight past that
+         * options dialog and uploads+reboots immediately with its
+         * default choice (fa_start_now()) -- "direct resetten en
+         * floppyemu beginnen", per this button's own brief. [OK] (button
+         * 1) just dismisses. Redraw FA_ROOT after a [Carousel] round
+         * that returns here (Cancelled, or a failure alert) rather than
+         * resetting -- fa_start_selected() opens a raw form_dial()-based
+         * dialog (fa_start_options_run()), which does not restore the
+         * screen under it on its own, unlike form_alert() itself (see
+         * dialog_close()'s own comment elsewhere in this file).
+         * fa_start_now() never opens that dialog at all (see its own
+         * comment), so no redraw is needed after it -- everything it can
+         * show on a non-reset return is a self-restoring form_alert(). */
+        sprintf(msg, "[1][Added to the Carousel|(slot %d of %d).][OK|Carousel|Start now]", carousel_slot, FA_CAROUSEL_SLOTS);
+        alert_result = form_alert(2, msg);
+        if (alert_result == 2) {
             fa_start_selected();
             objc_draw(fa_dlg, FA_ROOT, MAX_DEPTH, fa_dlg[FA_ROOT].ob_x, fa_dlg[FA_ROOT].ob_y,
                       fa_dlg[FA_ROOT].ob_width, fa_dlg[FA_ROOT].ob_height);
+        } else if (alert_result == 3) {
+            fa_start_now(carousel_slot);
         }
     } else {
         sprintf(msg, "[3][The Carousel is full|(%d of %d slots used).][OK]", FA_CAROUSEL_SLOTS, FA_CAROUSEL_SLOTS);
@@ -2326,36 +2346,39 @@ static void fa_add_selected_to_carousel(void)
     }
 }
 
-/* Carousel Start flow: build+upload the packed Carousel session (at most
- * FA_CAROUSEL_SLOTS entries, populated by fa_add_selected_to_carousel()
- * above and the Browser's own carousel-add branch in fm_browse_run() --
- * NOT every Favorite, unlike the original Phase 5 design this replaces)
- * -> ask the Phase 7 Start-options dialog for install_gemdrive ->
- * FLOPPY_SESSION_START on the Carousel's first entry -> reset, or show an
- * alert and stay in FLOPPY.PRG on any failure. Triggered only by
- * FA_START_BTN now -- it operates on the Carousel as a whole, not on
- * whichever Favorites row happens to be selected (there may be none).
- * No-op (with an explanatory alert) if the Carousel is currently empty --
- * there is nothing to start. */
-static void fa_start_selected(void)
+/* Builds+validates the packed Carousel session (at most FA_CAROUSEL_SLOTS
+ * entries, populated by fa_add_selected_to_carousel() above and the
+ * Browser's own carousel-add branch in fm_browse_run() -- NOT every
+ * Favorite, unlike the original Phase 5 design this replaces) into
+ * fa_start_session, ready for fa_start_with_mode() below. Shared by
+ * fa_start_selected() (which then still asks the Start-options dialog)
+ * and fa_start_now() (which skips straight past it) -- both need the
+ * exact same "is there anything to upload at all" checks first. Returns
+ * 1 if ready, 0 (with its own explanatory alert already shown) if not. */
+static int fa_start_prepare_session(void)
 {
-    int install_gemdrive;
+    if (!fa_build_carousel_session(&fa_start_session)) {
+        form_alert(1, "[3][Could not prepare the|Carousel (too much data).][OK]");
+        return 0;
+    }
+    if (fa_start_session.count == 0) {
+        form_alert(1, "[3][The Carousel is empty.|Double-click a game in|Favorites or the Browser|to add one first.][OK]");
+        return 0;
+    }
+    return 1;
+}
+
+/* Uploads fa_start_session (already built by fa_start_prepare_session())
+ * and starts it with the given install_gemdrive mode -> reset, or shows
+ * an alert and stays in FLOPPY.PRG on any failure. Shared tail end of
+ * both fa_start_selected() (mode chosen via the Start-options dialog) and
+ * fa_start_now() (mode fixed at "Floppy only" -- see its own comment). */
+static void fa_start_with_mode(int install_gemdrive)
+{
     char msg[200];
     unsigned long fav_status, probe_rc;
     FloppySessionResult session_result;
     const int install_floppy = 1; /* every Start combination for this phase installs the floppy -- see fa_start_options_run()'s own comment */
-
-    if (!fa_build_carousel_session(&fa_start_session)) {
-        form_alert(1, "[3][Could not prepare the|Carousel (too much data).][OK]");
-        return;
-    }
-    if (fa_start_session.count == 0) {
-        form_alert(1, "[3][The Carousel is empty.|Double-click a game in|Favorites or the Browser|to add one first.][OK]");
-        return;
-    }
-
-    if (!fa_start_options_run(&install_gemdrive))
-        return; /* Cancel/Esc -- no flag/session change, no reboot */
 
     graf_mouse(BUSY_BEE, 0L);
 
@@ -2412,6 +2435,60 @@ static void fa_start_selected(void)
     }
 
     Supexec(atari_do_hard_reset);
+}
+
+/* Carousel Start flow: prepare the session, ask the Phase 7 Start-options
+ * dialog for install_gemdrive, then upload+start it (fa_start_with_mode()
+ * above) -- reset on success, or an alert and stay in FLOPPY.PRG on any
+ * failure. Triggered by FA_START_BTN/FM_START_BTN and [Carousel] on the
+ * "Added to the Carousel" alert -- it operates on the Carousel as a
+ * whole, not on whichever Favorites row happens to be selected (there
+ * may be none). No-op if the Carousel is currently empty or Cancelled
+ * out of the options dialog -- fa_start_prepare_session()/
+ * fa_start_options_run() already alert/no-op appropriately themselves. */
+static void fa_start_selected(void)
+{
+    int install_gemdrive;
+
+    if (!fa_start_prepare_session())
+        return;
+
+    if (!fa_start_options_run(&install_gemdrive))
+        return; /* Cancel/Esc -- no flag/session change, no reboot */
+
+    fa_start_with_mode(install_gemdrive);
+}
+
+/* [Start now] on the "Added to the Carousel" alert -- "direct resetten en
+ * floppyemu beginnen", per this button's own brief: skips the Start-
+ * options dialog entirely and uploads+starts immediately with its
+ * default choice (Floppy only, same as fa_start_options_run()'s own
+ * fso_mode reset every time it opens) rather than asking first. Unlike
+ * fa_start_selected(), this never opens fa_start_options_run()'s own raw
+ * form_dial()-based dialog at all -- everything it can show on a
+ * non-reset return (fa_start_prepare_session()'s or fa_start_with_mode()'s
+ * own alerts) is a self-restoring form_alert(), so callers need no
+ * redraw-after-return of their own the way [Carousel] does.
+ *
+ * just_added_slot (1-based, the value fa_carousel_add() itself returned
+ * for the entry this alert is about) becomes the session's own
+ * active_index instead of fa_build_carousel_session()'s own default (the
+ * first occupied slot) -- every entry in the Carousel is still uploaded
+ * either way, only WHICH one SESSION_START mounts first changes. Per this
+ * button's own brief: adding a second game and choosing [Start now] there
+ * should boot straight into that second game, not silently jump back to
+ * the first one just because it happens to sit in an earlier slot. Pass 0
+ * to keep fa_build_carousel_session()'s own default (unused today, kept
+ * for callers with no one particular slot in mind). */
+static void fa_start_now(int just_added_slot)
+{
+    if (!fa_start_prepare_session())
+        return;
+
+    if (just_added_slot >= 1 && just_added_slot <= FA_CAROUSEL_SLOTS)
+        fa_start_session.active_index = (unsigned int)(just_added_slot - 1);
+
+    fa_start_with_mode(0); /* Floppy only */
 }
 
 /* Empties the currently selected favorite slot -- "Erase", not "Delete":
@@ -3135,9 +3212,29 @@ static OBJECT fm_dlg[FM_NOBJS];
 #define FM_ROW_BUF    (FM_CONTENT_CHARS + 1)      /* up to FM_CONTENT_CHARS of filename + NUL */
 static char fm_title_text[FM_TITLE_BUF]; /* current directory (or a placeholder) -- see fm_refresh() */
 static char fm_source_line[FM_SOURCE_BUF];
+/* FM_SOURCE_LINE's own right edge (fixed, next to [Change]) and leftmost
+ * allowed edge (fixed, next to [Dir Up]), both set by fm_dialog_init(),
+ * plus the pixel width of one character -- used by fm_set_source_line()
+ * below to right-justify the text within that span. G_STRING always
+ * draws left-justified from its own ob_x, so the only way to make the
+ * text hug the right edge is to move ob_x itself: once the text's own
+ * length is known, ob_x = right edge - text width, clamped so it never
+ * creeps left past [Dir Up] for an unusually long source name. */
+static int fm_source_left_x;
+static int fm_source_right_x;
+static int fm_source_cw;
 static char fm_row_text[FM_MAX_VISIBLE_FILES][FM_ROW_BUF];
 static int fm_selected_row = -1; /* -1 = no file selected */
 static int fm_short_screen; /* set by fm_dialog_init(), read by dialog_run() to open flush top-left instead of centered -- see dialog_open()'s own comment */
+/* Set by fm_form_do_events() when Undo is pressed while browsing -- unlike
+ * Tab/[Favorites], the Browser's own Undo quits the whole program right
+ * away (same key, same meaning, as Favorites' own Undo) rather than
+ * returning there first. fm_browse_run() itself still closes/returns
+ * normally either way (so its own cleanup/dialog_close() always runs);
+ * fa_open_browser() checks this flag right after and tells dialog_run()
+ * to end its own loop instead of redrawing Favorites. Reset at the top of
+ * every fm_browse_run() call. */
+static int fm_quit_requested;
 
 static void fm_dialog_init(void)
 {
@@ -3256,26 +3353,31 @@ static void fm_dialog_init(void)
 
     /* [Dir Up] left, [Change] right, [Source: .. Type: ..] text in
      * between -- all three share this one row now (see FM_DIRUP_BTN's
-     * own enum comment). Same 1cw-left-inset/13cw-width [Dir Up] always
-     * had in its old spot on the button row; [Change] mirrors it,
-     * right-anchored from DW the same way FM_PREV_BTN/FM_NEXT_BTN are.
-     * The source text itself is narrowed to fit exactly between the two
-     * buttons (with a 1cw gap each side) rather than spanning the full
-     * width like FM_TITLE -- its own text (up to FM_SOURCE_BUF-1 chars)
-     * comfortably fits the space left over. */
+     * own enum comment). [Dir Up]'s own width was trimmed down from the
+     * 13cw it had back when it was alone on the button row (that much
+     * padding just looked oversized here, next to a plain text label);
+     * [Change] mirrors [Dir Up]'s inset, right-anchored from DW the same
+     * way FM_PREV_BTN/FM_NEXT_BTN are. The source text's own box spans
+     * the space between the two buttons (with a 1cw gap each side) at
+     * init time, but fm_set_source_line() below moves its ob_x per call
+     * to right-justify the actual text -- see fm_source_right_x's own
+     * comment. */
     {
         int change_w = 10*lm.cw;
         int change_x = DW - xl - change_w;
         int dirup_x = xl + 1*lm.cw;
-        int dirup_w = 13*lm.cw;
+        int dirup_w = 8*lm.cw;
         int source_x = dirup_x + dirup_w + 1*lm.cw;
-        int source_w = (change_x - 1*lm.cw) - source_x;
+        int source_right = change_x - 1*lm.cw;
 
         set_obj(fm_dlg, FM_DIRUP_BTN, G_BUTTON, EXIT | TOUCHEXIT, NORMAL, dirup_x, ysource, dirup_w, lm.rh);
-        fm_dlg[FM_DIRUP_BTN].ob_spec.free_string = "   Dir Up   ";
+        fm_dlg[FM_DIRUP_BTN].ob_spec.free_string = " Dir Up ";
 
-        set_obj(fm_dlg, FM_SOURCE_LINE, G_STRING, NONE, NORMAL, source_x, ysource, source_w, lm.rh);
+        set_obj(fm_dlg, FM_SOURCE_LINE, G_STRING, NONE, NORMAL, source_x, ysource, source_right - source_x, lm.rh);
         fm_dlg[FM_SOURCE_LINE].ob_spec.free_string = fm_source_line;
+        fm_source_left_x = source_x;
+        fm_source_right_x = source_right;
+        fm_source_cw = lm.cw;
 
         /* Same server/source selector Favorites' own former [Source]
          * button opened -- see FM_CHANGE_BTN's own dispatch in
@@ -3389,6 +3491,28 @@ static void fm_apply_entries_to_rows(void)
         fm_dlg[FM_NEXT_BTN].ob_state |= (unsigned short)DISABLED;
 }
 
+/* Stores text into fm_source_line and right-justifies it by moving
+ * FM_SOURCE_LINE's own ob_x -- G_STRING always draws left-justified from
+ * ob_x, so the only way to make the text hug fm_source_right_x (next to
+ * [Change]) is to compute the text's own pixel width first and start
+ * that many pixels further left. Clamped to fm_source_left_x (next to
+ * [Dir Up]) for a source name too long to fit the whole gap -- it then
+ * simply starts flush left instead of overflowing past [Dir Up]. */
+static void fm_set_source_line(const char *text)
+{
+    int len = (int)strlen(text);
+    int new_x = fm_source_right_x - len * fm_source_cw;
+
+    if (new_x < fm_source_left_x)
+        new_x = fm_source_left_x;
+
+    strncpy(fm_source_line, text, sizeof(fm_source_line) - 1);
+    fm_source_line[sizeof(fm_source_line) - 1] = '\0';
+
+    fm_dlg[FM_SOURCE_LINE].ob_x = (short)new_x;
+    fm_dlg[FM_SOURCE_LINE].ob_width = (short)(fm_source_right_x - new_x);
+}
+
 static void fm_refresh(ProfileConfig *cfg)
 {
     const Profile *p;
@@ -3399,8 +3523,11 @@ static void fm_refresh(ProfileConfig *cfg)
     fm_search_active = 0; /* Browser (re)open and source change both funnel through here -- see fm_search_active's own comment */
 
     if (have_active) {
+        char raw[FM_SOURCE_BUF];
+
         p = &cfg->profiles[cfg->active_index];
-        sprintf(fm_source_line, "Source: %-.20s   Type: %s", p->nickname, profile_backend_word(p));
+        sprintf(raw, "Source: %-.20s   Type: %s", p->nickname, profile_backend_word(p));
+        fm_set_source_line(raw);
 
         if (fm_open_browse_for_active_profile(cfg)) {
             fm_load_entries();
@@ -3418,7 +3545,7 @@ static void fm_refresh(ProfileConfig *cfg)
         fm_entry_count = 0;
         strncpy(fm_cwd, "/Floppies", sizeof(fm_cwd) - 1);
         fm_cwd[sizeof(fm_cwd) - 1] = '\0';
-        sprintf(fm_source_line, "Source: (none selected)");
+        fm_set_source_line("Source: (none selected)");
     }
 
     fm_apply_entries_to_rows();
@@ -3670,15 +3797,35 @@ static short fm_form_do_events(int *out_double)
                  * dual-check convention Esc/Tab already established. */
                 result = (short)FM_DIRUP_BTN;
             } else if (scan == 0x61) {
-                /* Undo: same as [Favorites] -- same scan code Favorites' own
-                 * Undo-means-Quit uses, reused here for its own [Favorites]
-                 * equivalent. */
+                /* Undo: quits the whole program right away, same as
+                 * Favorites' own Undo -- NOT the same as [Favorites]/Tab
+                 * (which only backs out to the Favorites screen). Closes
+                 * this dialog normally (result resolves via FM_BACK_BTN's
+                 * own case, same cleanup path as any other exit), but
+                 * fm_quit_requested tells fa_open_browser()/dialog_run()
+                 * to end the whole program instead of redrawing Favorites
+                 * once this returns. */
+                fm_quit_requested = 1;
                 result = (short)FM_BACK_BTN;
             } else if (scan == 0x1F) {
                 /* S: same as [Search] -- scan code, standard AT/Atari S,
                  * same shortcut letter Favorites' own [Source] uses (no
                  * collision -- different dialogs). */
                 result = (short)FM_SEARCH_BTN;
+            } else if (scan == 0x2E) {
+                /* C: same as [Change] -- scan code, standard AT/Atari C.
+                 * Not S (already [Search] here) -- Favorites' own [S] for
+                 * its former [Source] button doesn't collide since that's
+                 * a different dialog, but this one already claimed S for
+                 * something else first. */
+                result = (short)FM_CHANGE_BTN;
+            } else if (scan == 0x3F) {
+                /* F5: same as [Start] -- starts the Carousel as a whole,
+                 * same shortcut Favorites' own [Start] uses (see
+                 * dialog_run()'s own F5 comment) -- the Carousel is one
+                 * global queue shared by both screens, so the same key
+                 * doing the same thing in both places is the right call. */
+                result = (short)FM_START_BTN;
             }
         }
     }
@@ -3712,6 +3859,7 @@ static int fm_browse_run(ProfileConfig *cfg, char *out_name, int out_name_cap,
     fm_refresh(cfg);
     dialog_open(fm_dlg, FM_ROOT, &geo, fm_short_screen);
 
+    fm_quit_requested = 0; /* see its own comment -- Undo may set it again below */
     done = 0;
     confirmed = 0;
     while (!done) {
@@ -3774,17 +3922,23 @@ static int fm_browse_run(ProfileConfig *cfg, char *out_name, int out_name_cap,
                     fa_build_favorite_path(cfg, car_dir, car_name, car_rec.path, sizeof(car_rec.path));
                     car_slot = fa_carousel_add(&car_rec);
                     if (car_slot > 0) {
-                        /* [Carousel] jumps straight into the Start flow,
-                         * same as Favorites' own carousel-add alert --
-                         * see fa_add_selected_to_carousel()'s own comment
-                         * for why the redraw (of fm_dlg here, since this
-                         * whole branch runs inside the Browser, not
-                         * Favorites) is needed on a return-without-
-                         * resetting outcome. */
-                        sprintf(car_msg, "[1][Added to the Carousel|(slot %d of %d).][OK|Carousel]", car_slot, FA_CAROUSEL_SLOTS);
-                        if (form_alert(1, car_msg) == 2) {
+                        int car_alert_result;
+
+                        /* [Carousel] (the default) and [Start now], same
+                         * as Favorites' own carousel-add alert -- see
+                         * fa_add_selected_to_carousel()'s own comment for
+                         * what each does and why only the [Carousel]
+                         * outcome needs a redraw (of fm_dlg here, since
+                         * this whole branch runs inside the Browser, not
+                         * Favorites) on a return-without-resetting
+                         * outcome. */
+                        sprintf(car_msg, "[1][Added to the Carousel|(slot %d of %d).][OK|Carousel|Start now]", car_slot, FA_CAROUSEL_SLOTS);
+                        car_alert_result = form_alert(2, car_msg);
+                        if (car_alert_result == 2) {
                             fa_start_selected();
                             objc_draw(fm_dlg, FM_ROOT, MAX_DEPTH, geo.x, geo.y, geo.w, geo.h);
+                        } else if (car_alert_result == 3) {
+                            fa_start_now(car_slot);
                         }
                     } else {
                         sprintf(car_msg, "[3][The Carousel is full|(%d of %d slots used).][OK]", FA_CAROUSEL_SLOTS, FA_CAROUSEL_SLOTS);
@@ -4024,6 +4178,17 @@ static int fa_open_browser(ProfileConfig *cfg, int hand_shown)
         fa_mode = FAVORITES_MODE_NORMAL;
         fa_place_rec.backend = 0;
     }
+
+    /* Undo, pressed while browsing -- see fm_quit_requested's own comment.
+     * The whole program is about to end (the caller checks this flag
+     * right after this call and ends its own loop), so none of Favorites'
+     * own refresh/redraw/cursor work below should run at all -- otherwise
+     * Favorites would visibly flash onto the screen for one frame right
+     * before quitting, which was exactly the bug this flag exists to
+     * avoid. hand_shown's returned value no longer matters. */
+    if (fm_quit_requested)
+        return hand_shown;
+
     fa_update_title(cfg);
     fa_refresh_rows();
     objc_draw(fa_dlg, FA_ROOT, MAX_DEPTH, fa_dlg[FA_ROOT].ob_x, fa_dlg[FA_ROOT].ob_y,
@@ -4288,6 +4453,8 @@ void dialog_run(ProfileConfig *cfg)
                             fa_switch_page(which - FA_TAB_BASE);
                         } else if (which == FA_BROWSER_BTN) {
                             hand_shown = fa_open_browser(cfg, hand_shown);
+                            if (fm_quit_requested)
+                                done = 1; /* Undo, pressed while browsing -- quit the whole program, see fm_quit_requested's own comment */
                         } else if (which == FA_MOVE_BTN) {
                             /* See fa_arm_move()'s own comment -- no-op if
                              * nothing is selected. FLAT_HAND then shows
@@ -4352,6 +4519,8 @@ void dialog_run(ProfileConfig *cfg)
                  * Tab) and ASCII (0x09) both checked, same dual-check
                  * convention Esc already established. */
                 hand_shown = fa_open_browser(cfg, hand_shown);
+                if (fm_quit_requested)
+                    done = 1; /* Undo, pressed while browsing -- quit the whole program, see fm_quit_requested's own comment */
             } else if ((scan == 0x01 || (kr & 0x00FF) == 0x1B) && fa_mode != FAVORITES_MODE_NORMAL) {
                 /* Esc while PLACE/MOVE MODE is armed (FLAT_HAND showing):
                  * cancel it and go back to plain ARROW/NORMAL MODE,
@@ -4387,6 +4556,14 @@ void dialog_run(ProfileConfig *cfg)
                 fa_switch_page(2); /* F3 -> 31-45 */
             } else if (scan == 0x3E) {
                 fa_switch_page(3); /* F4 -> 46-60 */
+            } else if (scan == 0x3F) {
+                /* F5: same as [Start] -- previously mouse-only. Not tied
+                 * to fa_selected_row (there may be no row selected at
+                 * all), same as FA_START_BTN's own click handling below.
+                 * Redraw afterward, same reasoning as that case gives. */
+                fa_start_selected();
+                objc_draw(fa_dlg, FA_ROOT, MAX_DEPTH, fa_dlg[FA_ROOT].ob_x, fa_dlg[FA_ROOT].ob_y,
+                          fa_dlg[FA_ROOT].ob_width, fa_dlg[FA_ROOT].ob_height);
             } else if (scan == 0x53 && (ks & K_CTRL)) {
                 /* Ctrl+Del: erase every slot on every page, with
                  * confirmation (unlike plain Erase/Delete, which never
